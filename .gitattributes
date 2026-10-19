@@ -1,0 +1,16 @@
+# Нормализуем переводы строк в репозитории
+* text=auto eol=lf
+
+*.py text diff=python
+*.md text
+*.txt text
+*.ps1 text eol=crlf
+*.spec text
+
+# Бинарники
+*.png binary
+*.jpg binary
+*.ico binary
+*.exe binary
+*.zip binary
+*.dat binary

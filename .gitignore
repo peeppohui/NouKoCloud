@@ -1,0 +1,36 @@
+# Сборка и бинарники
+/build/
+/dist/
+/bin/
+*.spec.bak
+__pycache__/
+
+# Python
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Ключи, токены и личные данные — НИКОГДА не коммитить
+config.json
+tokens.dat
+*.env
+.env
+*.part
+*.part.json
+cache.db
+*.log
+
+# Кэш превью программы
+.svscloud-preview/
+
+# IDE и ОС
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

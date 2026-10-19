@@ -1,0 +1,105 @@
+"""Тесты окна: массовое скачивание и кнопка «Скачать только этот файл»."""
+
+from __future__ import annotations
+
+import os
+import tempfile
+import unittest
+from pathlib import Path
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtCore import Qt  # noqa: E402
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+from app.core.config import AppConfig  # noqa: E402
+from app.core.models import CloudFile, EntryKind, ProviderId, SourceKind  # noqa: E402
+from app.context import build_context  # noqa: E402
+from app.providers.base import BrowseContext  # noqa: E402
+from app.ui.main_window import MainWindow  # noqa: E402
+
+_app: QApplication | None = None
+
+
+def setUpModule() -> None:
+    global _app
+    _app = QApplication.instance() or QApplication([])
+
+
+def make_file(name: str, size: int = 1024) -> CloudFile:
+    return CloudFile(
+        provider=ProviderId.YANDEX,
+        file_id=name,
+        path=f"/исх/{name}",
+        name=name,
+        kind=EntryKind.FILE,
+        size=size,
+        source=SourceKind.PUBLIC,
+    )
+
+
+class TestMainWindow(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        config = AppConfig()
+        config.download_dir = str(Path(self._tmp.name))
+        self.ctx = build_context(config)
+        self.win = MainWindow(self.ctx)
+
+    def tearDown(self) -> None:
+        future = self.ctx.runtime.submit(self.ctx.engine.stop())
+        try:
+            future.result(timeout=5)
+        except Exception:
+            pass
+        self.ctx.cache.close()
+
+    def _fill_tree(self, count: int) -> None:
+        ctx = BrowseContext(source=SourceKind.PUBLIC, public_key="https://disk.yandex.ru/d/X")
+        root = self.win.tree.add_root("Яндекс.Диск · X", ctx)
+        folder = None
+        for row in range(root.rowCount()):
+            if root.child(row).text() == "исх":
+                folder = root.child(row)
+        if folder is None:
+            self.fail("в дереве нет папки «исх»")
+
+    def test_button_shows_count_of_checked_files(self) -> None:
+        """Кнопка должна показывать, сколько файлов уедет в очередь."""
+        tree = self.win.tree
+        ctx = BrowseContext(source=SourceKind.PUBLIC, public_key="https://disk.yandex.ru/d/X")
+        root = tree.add_root("корень", ctx)
+        tree.set_children(root, [make_file(f"C{i:04d}.MP4", 28 * 1024 * 1024) for i in range(1, 142)])
+
+        button = self.win._btn_download
+        self.assertFalse(button.isEnabled())
+        self.assertEqual(button.text(), "Скачать выбранное (0)")
+
+        tree._set_all_checked(True)
+        self.assertTrue(button.isEnabled())
+        self.assertEqual(button.text(), "Скачать выбранное (141)")
+        self.assertIn("141", button.toolTip())
+        self.assertIn("141", self.win._selection_label.text())
+
+    def test_checked_files_are_all_enqueued(self) -> None:
+        """Все отмеченные файлы должны попасть в очередь (а не один)."""
+        tree = self.win.tree
+        ctx = BrowseContext(source=SourceKind.PUBLIC, public_key="https://disk.yandex.ru/d/X")
+        root = tree.add_root("корень", ctx)
+        tree.set_children(root, [make_file(f"C{i:04d}.MP4") for i in range(1, 142)])
+        tree._set_all_checked(True)
+
+        self.assertEqual(len(tree.checked_files()), 141)
+        self.win._download_selected()
+        # очередь наполняется в фоновом потоке — проверяем счётчик заданий
+        import time
+
+        deadline = time.time() + 5
+        while time.time() < deadline and not self.ctx.engine.snapshot():
+            time.sleep(0.05)
+        jobs = self.ctx.engine.snapshot()
+        self.assertEqual(len(jobs), 141, "в очередь должно встать 141 файл")
+
+
+if __name__ == "__main__":
+    unittest.main()
