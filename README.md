@@ -5,11 +5,11 @@
 отметить нужные файлы и скачать их с докачкой.
 
 ![стек](https://img.shields.io/badge/Python-3.12%2B-blue) ![Qt](https://img.shields.io/badge/PySide6-6.12-green)
-[![Скачать](https://img.shields.io/badge/скачать-svsCloud%200.1.0-2f6fed?style=flat-square)](https://github.com/peeppohui/svsCloud/releases/latest/download/svsCloud-0.1.0-win64.zip)
+[![Скачать](https://img.shields.io/badge/скачать-svsCloud-2f6fed?style=flat-square)](https://github.com/peeppohui/svsCloud/releases/latest/download/svsCloud-win64.zip)
 
 ## 📥 Скачать
 
-**[⬇ Скачать svsCloud 0.1.0 для Windows](https://github.com/peeppohui/svsCloud/releases/latest/download/svsCloud-0.1.0-win64.zip)** — 136 МБ
+**[⬇ Скачать svsCloud для Windows](https://github.com/peeppohui/svsCloud/releases/latest/download/svsCloud-win64.zip)** — 136 МБ
 
 Распакуйте архив и запустите `svsCloud.exe`. Python устанавливать не нужно.
 
