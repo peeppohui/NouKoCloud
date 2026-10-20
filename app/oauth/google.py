@@ -12,7 +12,7 @@ from urllib.parse import urlencode
 
 import httpx
 
-from ..core.errors import AuthError
+from ..core.errors import AuthError, ServerError
 from ..core.models import ProviderId
 from .base import OAuthProvider, OAuthTokens
 
@@ -28,6 +28,26 @@ DEFAULT_SCOPES = (
     "openid",
     "email",
 )
+
+
+DRIVE_SCOPE = DEFAULT_SCOPES[0]
+
+NO_DRIVE_ACCESS = (
+    "Google не дал программе доступ к Диску: на странице входа не отмечена галочка "
+    "«Просмотр и скачивание всех файлов на Google Диске». Нажмите «Войти через "
+    "Google Диск» ещё раз и отметьте её."
+)
+
+
+def has_drive_access(scope: str) -> bool:
+    """Есть ли в выданных правах доступ к файлам Диска.
+
+    Пустой scope считаем «неизвестно» (старые сохранённые входы) — не мешаем.
+    """
+    granted = set((scope or "").split())
+    if not granted:
+        return True
+    return bool(granted & {DRIVE_SCOPE, "https://www.googleapis.com/auth/drive"})
 
 
 class GoogleOAuth(OAuthProvider):
@@ -69,13 +89,19 @@ class GoogleOAuth(OAuthProvider):
             raise AuthError("Google не принял код авторизации. Попробуйте войти ещё раз.",
                             technical=f"{response.status_code}: {response.text[:500]}")
         payload = response.json()
-        return OAuthTokens(
+        tokens = OAuthTokens(
             access_token=payload["access_token"],
             refresh_token=payload.get("refresh_token"),
             expires_at=time.time() + float(payload.get("expires_in") or 3600),
             scope=payload.get("scope", ""),
             token_type=payload.get("token_type", "Bearer"),
         )
+        if not has_drive_access(tokens.scope):
+            # Google показывает права галочками: без отмеченного Диска вход
+            # «успешен», но любой запрос к файлам — 403. Говорим сразу.
+            log.warning("Google не выдал доступ к Диску: scope=%s", tokens.scope)
+            raise AuthError(NO_DRIVE_ACCESS, technical=f"scope без Диска: {tokens.scope}")
+        return tokens
 
     async def refresh(self, tokens: OAuthTokens) -> OAuthTokens:
         if not tokens.refresh_token:
@@ -88,9 +114,13 @@ class GoogleOAuth(OAuthProvider):
         }
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(TOKEN_URL, data=data)
-        if response.status_code != 200:
+        if response.status_code in (400, 401):
+            # invalid_grant и т. п.: refresh-токен отозван — нужен новый вход.
             raise AuthError("Не удалось обновить вход в Google. Войдите заново.",
                             technical=f"{response.status_code}: {response.text[:500]}")
+        if response.status_code != 200:
+            # Сбой на стороне Google — вход не теряем, повторим позже.
+            raise ServerError(technical=f"refresh Google: {response.status_code}: {response.text[:300]}")
         payload = response.json()
         return OAuthTokens(
             access_token=payload["access_token"],

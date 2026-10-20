@@ -17,7 +17,7 @@ from ..core.errors import AuthError
 from ..core.models import ProviderId
 from ..core.secrets_store import TokenStore
 from .base import OAuthProvider, OAuthTokens
-from .google import GoogleOAuth
+from .google import GoogleOAuth, has_drive_access
 from .loopback import LoopbackRedirectServer
 from .yandex import REDIRECT_URIS, YandexOAuth
 
@@ -59,9 +59,17 @@ class OAuthManager:
             data = self._store.get(pid.value)
             if data:
                 try:
-                    self._tokens[pid] = OAuthTokens.from_dict(data)
+                    tokens = OAuthTokens.from_dict(data)
                 except Exception as exc:
                     log.warning("Битый токен %s: %s", pid.value, exc)
+                    continue
+                if pid is ProviderId.GOOGLE and not has_drive_access(tokens.scope):
+                    # Вход без галочки «Google Диск»: с ним не открыть ни одного
+                    # файла. Считаем, что входа нет, — программа предложит войти.
+                    log.warning("Сохранённый вход Google без доступа к Диску — нужен новый вход")
+                    self._store.clear(pid.value)
+                    continue
+                self._tokens[pid] = tokens
 
     # ------------------------------------------------------------------
     def provider(self, pid: ProviderId) -> OAuthProvider:
@@ -97,7 +105,9 @@ class OAuthManager:
         provider = self._providers[pid]
         server = LoopbackRedirectServer()
         await server.start()
-        url = provider.authorization_url(server.redirect_uri, state="svscloud")
+        # Тот же адрес обязан уйти и в обмен кода — берём его, пока сервер жив.
+        redirect_uri = server.redirect_uri
+        url = provider.authorization_url(redirect_uri, state="svscloud")
         log.info("Открываем браузер: %s", url)
         await asyncio.to_thread(webbrowser.open, url)
         try:
@@ -106,7 +116,7 @@ class OAuthManager:
             raise AuthError("Вход не завершён за 5 минут. Попробуйте ещё раз.") from None
         finally:
             await server.stop()
-        tokens = await provider.exchange_code(code, server.redirect_uri)
+        tokens = await provider.exchange_code(code, redirect_uri)
         await self._store_tokens(pid, tokens)
         return self._names.get(pid, provider.display_name)
 

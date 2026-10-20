@@ -13,7 +13,8 @@ from ..core.models import ProviderId, SourceKind
 log = logging.getLogger(__name__)
 
 _YANDEX_HOSTS = ("disk.yandex.ru", "disk.yandex.com", "yadi.sk", "yandex.ru")
-_YANDEX_KEY_RE = re.compile(r"/(?:d|i)/([A-Za-z0-9_\-+=]+)")
+# /d/<ключ> — ссылка на папку, /i/<ключ> — на отдельный файл (фото, видео).
+_YANDEX_KEY_RE = re.compile(r"/(d|i)/([A-Za-z0-9_\-+=]+)")
 _GOOGLE_FILE_RE = re.compile(r"/file/d/([A-Za-z0-9_\-]+)")
 _GOOGLE_DOC_RE = re.compile(r"/d/([A-Za-z0-9_\-]+)")
 _GOOGLE_FOLDER_RE = re.compile(r"/folders/([A-Za-z0-9_\-]+)")
@@ -59,17 +60,17 @@ def _parse_yandex(parsed, query) -> ParsedLink:
     match = _YANDEX_KEY_RE.search(path)
     if not match:
         raise BadLinkError("Не удалось найти ключ в ссылке Яндекс.Диска.")
-    key = match.group(1)
+    kind, key = match.group(1), match.group(2)
     subpath = "/"
     raw_path = (query.get("path") or [""])[0]
     if raw_path:
         subpath = unquote(raw_path)
         if not subpath.startswith("/"):
             subpath = "/" + subpath
-    # API принимает и полный ключ, и публичную ссылку целиком.
-    # Короткий идентификатор из ссылки (/d/XXXX) API не понимает —
-    # отдаём канонический URL.
-    public_url = f"https://disk.yandex.ru/d/{key}"
+    # API принимает публичную ссылку целиком; короткий ключ (XXXX из /d/XXXX)
+    # он не понимает. Тип ссылки сохраняем: ссылка на файл (/i/), превращённая
+    # в /d/, для Яндекса не существует — отвечает 404 «ничего нет».
+    public_url = f"https://disk.yandex.ru/{kind}/{key}"
     return ParsedLink(
         provider=ProviderId.YANDEX,
         source=SourceKind.PUBLIC,

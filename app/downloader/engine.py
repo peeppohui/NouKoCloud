@@ -17,7 +17,7 @@ from ..net.http_client import HttpClient
 from ..net.metadata_cache import MetadataCache
 from ..providers.registry import ProviderRegistry
 from .state import find_states, load_state, save_state, state_dest
-from .transfer import Cancelled, Transfer, TransferContext
+from .transfer import Cancelled, Transfer, TransferContext, _discard_partial
 
 log = logging.getLogger(__name__)
 
@@ -103,7 +103,8 @@ class DownloadEngine:
         rel = (file.path or file.name).replace("\\", "/").strip("/")
         parts = [part for part in rel.split("/") if part and part not in (".", "..")]
         if len(parts) > 1:
-            return root.joinpath(*parts[:-1])
+            # Имена папок в облаке тоже могут содержать «:», «?» и т. п.
+            return root.joinpath(*(_safe_name(part) for part in parts[:-1]))
         return root
 
     async def recover(self, dest_dir: Path) -> list[DownloadJob]:
@@ -157,15 +158,21 @@ class DownloadEngine:
         if job.state in (JobState.QUEUED, JobState.PAUSED):
             job.state = JobState.CANCELLED
             job.finished_at = time.time()
+        if job_id not in self._running:
+            # Работающее задание уберёт за собой само (см. _run_job).
+            self._drop_unfinished(job)
         self._emit_snapshot()
 
     async def remove(self, job_id: str) -> None:
-        """Убирает задание из списка (файл на диске не трогаем)."""
+        """Убирает задание из списка (скачанный файл на диске не трогаем)."""
         job = self._jobs.pop(job_id, None)
         if job is None:
             return
         job.cancel_event.set()
         job.pause_event.set()
+        # Прогресс упавшей загрузки сохраняем: её подхватит recover().
+        if job_id not in self._running and job.state is not JobState.FAILED:
+            self._drop_unfinished(job)
         if job.job_id in self._order:
             self._order.remove(job.job_id)
         self._emit_snapshot()
@@ -215,6 +222,10 @@ class DownloadEngine:
             job.state = JobState.CANCELLED
             job.finished_at = time.time()
             log.info("Отменено: %s", job.file.name)
+            # При закрытии программы задания тоже «отменяются», но их надо
+            # продолжить после перезапуска. Отмену пользователем — нет.
+            if not self._closing:
+                self._drop_unfinished(job)
         except asyncio.CancelledError:
             job.state = JobState.CANCELLED
             raise
@@ -233,6 +244,12 @@ class DownloadEngine:
         self._emit_snapshot()
         self._bus.job_finished.emit(job)
         self._running.discard(job.job_id)
+
+    @staticmethod
+    def _drop_unfinished(job: DownloadJob) -> None:
+        """Удаляет .part и .part.json, иначе recover() поднимет задание снова."""
+        if job.state not in (JobState.DONE, JobState.SKIPPED):
+            _discard_partial(job)
 
     # ------------------------------------------------------------------
     def _on_progress(self, job: DownloadJob) -> None:

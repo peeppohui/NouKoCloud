@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -43,8 +43,8 @@ class PreviewPanel(QWidget):
         self._info.setWordWrap(True)
         layout.addWidget(self._info)
 
-        self._player = PreviewPlayer(self)
-        layout.addWidget(self._player, 1)
+        self.player = PreviewPlayer(self)
+        layout.addWidget(self.player, 1)
 
         actions = QHBoxLayout()
         self._btn_download = QPushButton("Скачать только этот файл", self)
@@ -55,6 +55,7 @@ class PreviewPanel(QWidget):
         )
         self._btn_download.setProperty("accent", True)
         self._btn_download.clicked.connect(self._emit_download)
+        self._btn_download.setEnabled(False)
         actions.addWidget(self._btn_download)
         actions.addStretch(1)
         layout.addLayout(actions)
@@ -62,7 +63,17 @@ class PreviewPanel(QWidget):
         self._file: CloudFile | None = None
 
     # ------------------------------------------------------------------
-    def show_file(self, file: CloudFile, url: str, note: str = "") -> None:
+    @property
+    def current_file(self) -> CloudFile | None:
+        return self._file
+
+    def show_file(self, file: CloudFile, url: str, kind: str, autoplay: bool = True,
+                  message: str = "", buffer_probe=None) -> None:
+        """Показывает файл: kind — video | audio | image | unknown.
+
+        message — если превью показать нельзя, текст вместо плеера.
+        buffer_probe — состояние кэша потока (для буферизации, см. PreviewPlayer).
+        """
         self._file = file
         self._title.setText(file.name)
         details = [f"Размер: {human_size(file.size)}"]
@@ -70,18 +81,29 @@ class PreviewPanel(QWidget):
             details.append(f"Формат: {file.mime}")
         if file.modified:
             details.append(f"Изменён: {file.modified.strftime('%d.%m.%Y %H:%M')}")
-        if note:
-            details.append(note)
         self._info.setText("  ·  ".join(details))
-        self._player.show_url(url)
         self._btn_download.setEnabled(True)
+
+        if message:
+            self.player.show_message(message)
+        elif kind in ("video", "audio"):
+            self.player.play(url, kind, file.name, autoplay=autoplay, buffer_probe=buffer_probe)
+        elif kind == "image":
+            self.player.show_image(url)
+        else:
+            self.player.show_message(
+                "Превью этого формата недоступно. Скачайте файл, чтобы посмотреть его."
+            )
 
     def show_message(self, text: str) -> None:
         self._file = None
         self._title.setText("")
         self._info.setText("")
-        self._player.show_message(text)
+        self.player.show_message(text)
         self._btn_download.setEnabled(False)
+
+    def stop(self) -> None:
+        self.player.stop()
 
     def _emit_download(self) -> None:
         if self._file is not None:

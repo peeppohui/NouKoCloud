@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 from typing import Optional
+from urllib.parse import urlencode
 
 from ..core.models import CloudFile, DownloadLink, EntryKind, MediaInfo, ProviderId, SourceKind
 from .base import BrowseContext, CloudProvider
@@ -23,10 +24,12 @@ log = logging.getLogger(__name__)
 
 API = "https://www.googleapis.com/drive/v3"
 UPLOAD_API = "https://www.googleapis.com/upload/drive/v3"
+# В Drive API v3 длительность видео — durationMillis. С несуществующим полем
+# (было durationMs) Google отвечает 400 на весь список, и «Мой диск» не открывался.
 FIELDS = (
     "nextPageToken,files(id,name,mimeType,size,modifiedTime,md5Checksum,parents,"
     "thumbnailLink,webContentLink,shortcutDetails,driveId,resourceKey,"
-    "capabilities(canDownload),videoMediaMetadata(durationMs,height,width))"
+    "capabilities(canDownload),videoMediaMetadata(durationMillis,height,width))"
 )
 FOLDER_MIME = "application/vnd.google-apps.folder"
 SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
@@ -36,7 +39,7 @@ EXPORT_MIME = {
     "application/vnd.google-apps.document": ("application/pdf", ".pdf"),
     "application/vnd.google-apps.spreadsheet": ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".xlsx"),
     "application/vnd.google-apps.presentation": ("application/pdf", ".pdf"),
-    "application/vnd.google-apps.drawing": ("application/png", ".png"),
+    "application/vnd.google-apps.drawing": ("image/png", ".png"),   # не application/png — Google ответит 400
 }
 
 
@@ -88,6 +91,9 @@ class GoogleProvider(CloudProvider):
         headers = await self._headers(ctx)
         collected: list[CloudFile] = []
         page_token = ""
+        # Путь от корня открытой папки: по нему загрузчик воспроизводит
+        # структуру папок, и одноимённые файлы из разных папок не сталкиваются.
+        parent_path = (parent.path if parent is not None else "").strip("/")
 
         while True:
             if page_token:
@@ -97,7 +103,7 @@ class GoogleProvider(CloudProvider):
             )
             payload = response.json()
             for raw in payload.get("files", []):
-                child = self._parse_item(raw, ctx)
+                child = self._parse_item(raw, ctx, parent_path)
                 if child is not None:
                     collected.append(child)
             page_token = payload.get("nextPageToken")
@@ -106,7 +112,7 @@ class GoogleProvider(CloudProvider):
 
         return collected
 
-    def _parse_item(self, raw: dict, ctx: BrowseContext) -> Optional[CloudFile]:
+    def _parse_item(self, raw: dict, ctx: BrowseContext, parent_path: str = "") -> Optional[CloudFile]:
         file_id = raw.get("id")
         name = raw.get("name")
         if not file_id or not name:
@@ -136,7 +142,7 @@ class GoogleProvider(CloudProvider):
         return CloudFile(
             provider=ProviderId.GOOGLE,
             file_id=file_id,
-            path=name,
+            path=f"{parent_path}/{name}" if parent_path else name,
             name=name,
             kind=EntryKind.FOLDER if is_folder else EntryKind.FILE,
             size=int(raw.get("size") or 0),
@@ -149,7 +155,7 @@ class GoogleProvider(CloudProvider):
             google_mime=mime,
             thumbnail_link=raw.get("thumbnailLink"),
             preview_hint=raw.get("thumbnailLink"),
-            media_duration_ms=int(video.get("durationMs")) if video.get("durationMs") else None,
+            media_duration_ms=int(video.get("durationMillis")) if video.get("durationMillis") else None,
             media_width=video.get("width"),
             media_height=video.get("height"),
             can_download=bool((raw.get("capabilities") or {}).get("canDownload", True)),
@@ -172,25 +178,24 @@ class GoogleProvider(CloudProvider):
 
     # ------------------------------------------------------------------
     async def resolve_download(self, file: CloudFile) -> DownloadLink:
-        cached = await self.cached_link(file)
-        if cached is not None and not cached.is_expired():
-            return cached
-
+        # Ссылка собирается локально, без запроса к API, поэтому кэш не нужен:
+        # иначе вместе со ссылкой пришлось бы хранить и (протухающий) токен.
         params: dict = {"supportsAllDrives": "true"}
-        if file.resource_key:
-            params["resourceKey"] = file.resource_key
         if file.source is SourceKind.PUBLIC:
             if self.config.google_api_key:
                 params["key"] = self.config.google_api_key
             headers: dict[str, str] = {}
         else:
             headers = {"Authorization": f"Bearer {await self.oauth.access_token(ProviderId.GOOGLE)}"}
+        if file.resource_key:
+            # Drive v3 принимает ключ ресурса только заголовком.
+            headers["X-Goog-Drive-Resource-Keys"] = f"{file.file_id}/{file.resource_key}"
 
         google_mime = file.google_mime or file.mime or ""
         if google_mime.startswith(GOOGLE_APP_MIME_PREFIX):
             export_mime, ext = EXPORT_MIME.get(google_mime, ("application/pdf", ".pdf"))
             params["mimeType"] = export_mime
-            url = f"{API}/files/{file.file_id}/export"
+            url = f"{API}/files/{file.file_id}/export?{urlencode(params)}"
             link = DownloadLink(
                 url=url,
                 headers={**headers, "Accept-Encoding": "identity"},
@@ -201,7 +206,7 @@ class GoogleProvider(CloudProvider):
             )
         else:
             params["alt"] = "media"
-            url = f"{API}/files/{file.file_id}"
+            url = f"{API}/files/{file.file_id}?{urlencode(params)}"
             link = DownloadLink(
                 url=url,
                 headers={**headers, "Accept-Encoding": "identity"},
@@ -210,8 +215,6 @@ class GoogleProvider(CloudProvider):
                 expires_at=None,
                 content_type=file.mime or None,
             )
-
-        self.remember_link(file, link)
         return link
 
     # ------------------------------------------------------------------

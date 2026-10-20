@@ -12,7 +12,7 @@ import asyncio
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Optional
 
 import httpx
@@ -99,21 +99,14 @@ class Transfer:
     # ------------------------------------------------------------------
     async def run(self, job: DownloadJob) -> bool:
         """Скачивает файл. True — успех."""
-        file = job.file
         job.dest_dir.mkdir(parents=True, exist_ok=True)
-        final = job.final_path
+        if self._pick_target_name(job):
+            log.info("Уже скачан: %s", job.final_path.name)
+            job.state = JobState.SKIPPED
+            job.downloaded_bytes = job.total_bytes = job.file.size
+            return True
+        file = job.file
         part = job.part_path
-
-        if final.exists():
-            if not file.size or final.stat().st_size == file.size:
-                log.info("Уже скачан: %s", final.name)
-                job.state = JobState.SKIPPED
-                job.downloaded_bytes = job.total_bytes = file.size
-                return True
-            try:
-                final.unlink()
-            except OSError:
-                pass
 
         link = await self._ctx.registry.get(file.provider).resolve_download(file)
         job.link = link
@@ -158,6 +151,31 @@ class Transfer:
         return True
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _pick_target_name(job: DownloadJob) -> bool:
+        """Выбирает имя файла на диске. True — такой файл уже скачан.
+
+        Чужой файл с тем же именем, но другим размером не удаляем:
+        качаем рядом под именем «имя (1).ext».
+        """
+        file = job.file
+        stem, suffix = os.path.splitext(file.name)
+        for attempt in range(1000):
+            name = file.name if attempt == 0 else f"{stem} ({attempt}){suffix}"
+            final = job.dest_dir / name
+            if final.exists():
+                if file.size and final.stat().st_size == file.size:
+                    job.file = replace(file, name=name)
+                    return True
+                if not file.size and attempt == 0:
+                    return True
+                continue
+            if name != file.name:
+                log.info("%s уже есть и отличается — сохраняем как %s", file.name, name)
+                job.file = replace(file, name=name)
+            return False
+        raise IOError(f"Не удалось подобрать свободное имя для {file.name}")
+
     def _new_segments(self, job: DownloadJob, total: int) -> list[Segment]:
         if not self._config.use_segments or total <= 0:
             segments = [Segment(index=0, start=0, end=max(0, total - 1))]
@@ -202,7 +220,8 @@ class Transfer:
                 "HEAD", link.url, provider=self._provider_key(file), headers=link.headers, raise_for_status=False
             )
             length = response.headers.get("content-length")
-            if length and length.isdigit():
+            # У ответа-ошибки Content-Length — это длина страницы ошибки, а не файла.
+            if response.status_code < 300 and length and length.isdigit():
                 return int(length)
         except Exception as exc:
             log.debug("HEAD не удался: %s", exc)
@@ -331,20 +350,33 @@ class Transfer:
         if not job.segments:
             job.segments = [Segment(index=0, start=0, end=max(0, job.total_bytes - 1))]
         seg = job.segments[0]
+        # Размер неизвестен (например, экспорт Google Документов): конец файла
+        # определяем только по нормальному завершению потока, а после обрыва
+        # начинаем заново — продолжить «с середины» без длины нельзя.
+        unknown_size = job.total_bytes <= 0
         attempts = 0
         max_attempts = min(2, self._config.max_retries) if not allow_range else self._config.max_retries
-        while not seg.done:
+        while unknown_size or not seg.done:
             if job.cancel_event.is_set():
                 raise Cancelled()
+            if unknown_size:
+                seg.received = 0
             try:
-                await self._pull_single(job, seg, fd, allow_range=allow_range, timeout=timeout)
+                await self._pull_single(
+                    job, seg, fd, allow_range=allow_range and not unknown_size, timeout=timeout
+                )
                 attempts = 0
+                if unknown_size:
+                    os.ftruncate(fd, seg.received)
+                    job.total_bytes = seg.received
+                    break
             except Cancelled:
                 raise
             except Exception as exc:
                 attempts += 1
                 if attempts > max_attempts:
                     raise
+                log.warning("%s: %s — повтор", job.file.name, exc)
                 await asyncio.sleep(min(2 ** attempts, 30))
         job.downloaded_bytes = sum(s.received for s in job.segments)
 
@@ -401,6 +433,8 @@ class Transfer:
 
     async def _refresh_link(self, job: DownloadJob) -> None:
         provider = self._ctx.registry.get(job.file.provider)
+        # Ссылка из кэша только что отказала — берём новую у облака.
+        provider.forget_link(job.file)
         link = await provider.resolve_download(job.file)
         job.link = link
         log.info("Ссылка на %s обновлена", job.file.name)
@@ -422,11 +456,15 @@ class Transfer:
         except OSError:
             size = 0
         if job.total_bytes and size != job.total_bytes:
+            _discard_partial(job)
             raise IOError(f"Размер не совпал: {size} вместо {job.total_bytes}")
 
         if job.file.md5:
-            actual = _md5_of(part)
+            # MD5 многогигабайтного файла считается десятки секунд — не держим event loop.
+            actual = await asyncio.to_thread(_md5_of, part)
             if actual and actual.lower() != job.file.md5.lower():
+                # Иначе повтор «докачает» нулевой остаток и снова упрётся в ту же сумму.
+                _discard_partial(job)
                 raise IOError("Контрольная сумма не совпала — файл повреждён")
 
         os.replace(part, final)
@@ -434,6 +472,15 @@ class Transfer:
         job.state = JobState.DONE
         job.finished_at = time.time()
         log.info("Готово: %s (%s)", final.name, _human(size))
+
+
+def _discard_partial(job: DownloadJob) -> None:
+    """Удаляет недокачанный файл и его состояние — следующая попытка начнёт с нуля."""
+    try:
+        job.part_path.unlink(missing_ok=True)
+    except OSError as exc:
+        log.warning("Не удалось удалить %s: %s", job.part_path, exc)
+    clear_state(job.state_path)
 
 
 def _md5_of(path) -> str | None:

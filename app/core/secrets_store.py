@@ -37,7 +37,8 @@ def _protect(data: bytes) -> bytes:
 
 def _unprotect(data: bytes) -> bytes:
     if _HAS_DPAPI:
-        blob, _desc = win32crypt.CryptUnprotectData(data, None, None, None, 0)  # type: ignore[union-attr]
+        # pywin32 возвращает (описание, данные) — именно в таком порядке.
+        _desc, blob = win32crypt.CryptUnprotectData(data, None, None, None, 0)  # type: ignore[union-attr]
         return blob
     return data
 
@@ -54,7 +55,7 @@ class TokenStore:
         if not self._path.exists():
             return
         try:
-            raw = self._unprotect(self._path.read_bytes())
+            raw = _unprotect(self._path.read_bytes())
             self._data = json.loads(raw.decode("utf-8"))
         except Exception as exc:
             log.warning("Не удалось прочитать сохранённые токены: %s", exc)
@@ -62,7 +63,7 @@ class TokenStore:
 
     def _save(self) -> None:
         payload = json.dumps(self._data, ensure_ascii=False, indent=2).encode("utf-8")
-        blob = self._protect(payload)
+        blob = _protect(payload)
         tmp = self._path.with_suffix(".tmp")
         tmp.write_bytes(blob)
         if sys.platform != "win32":

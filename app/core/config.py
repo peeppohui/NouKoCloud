@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 import uuid
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
@@ -56,6 +57,8 @@ class AppConfig:
     preview_max_height: int = 720
     preview_proxy_seconds: int = 60
     preview_autoplay: bool = True
+    preview_cache_gb: float = 4.0      # сколько места на диске под кэш превью
+    preview_cache_dir: str = ""        # где хранить кэш превью; пусто — в папке загрузок
 
     # --- Служебное ---
     window_geometry: str = ""
@@ -70,14 +73,32 @@ class AppConfig:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
+    @property
+    def preview_cache_path(self) -> Path:
+        """Папка с файлами кэша превью.
+
+        Это всегда отдельная подпапка `.svscloud-preview` внутри выбранной
+        папки: «Очистить кэш» удаляет только её содержимое и не может задеть
+        файлы пользователя, даже если он выбрал общую папку вроде D:\\.
+        """
+        return preview_cache_path_for(self.preview_cache_dir, self.download_dir)
+
     def to_dict(self) -> dict:
         return asdict(self)
 
     def save(self) -> None:
-        CONFIG_FILE.write_text(
-            json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        log.info("Настройки сохранены: %s", CONFIG_FILE)
+        # Сохраняем только настройки, загруженные из файла пользователя
+        # (AppConfig.load). Временная конфигурация — AppConfig() в тестах и
+        # проверочных запусках — раньше при закрытии окна перезаписывала
+        # настоящий файл: стирала ключи и подменяла папку загрузок на Temp.
+        path = getattr(self, "_config_path", None)
+        if path is None:
+            log.debug("Настройки не сохраняются: конфигурация не из файла пользователя")
+            return
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+        log.info("Настройки сохранены: %s", path)
 
     @classmethod
     def load(cls) -> "AppConfig":
@@ -91,6 +112,8 @@ class AppConfig:
         if CONFIG_FILE.exists():
             cfg._apply_file(CONFIG_FILE)
         _apply_env_overrides(cfg)
+        cfg._config_path = CONFIG_FILE
+        _repair_download_dir(cfg)
         if not cfg.device_id:
             # Идентификатор устройства для Яндекс OAuth: пользователь видит
             # в своих настройках, какое устройство имеет доступ к диску,
@@ -101,7 +124,9 @@ class AppConfig:
     def _apply_file(self, path: Path) -> None:
         """Читает файл настроек. Пустые значения не затирают заданные."""
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
+            # utf-8-sig: build.ps1 (Windows PowerShell 5) пишет файл с BOM,
+            # а обычный utf-8 на BOM падает — и «вшитые» ключи терялись.
+            raw = json.loads(path.read_text(encoding="utf-8-sig"))
         except Exception as exc:
             log.warning("Не удалось прочитать настройки %s: %s", path, exc)
             return
@@ -114,6 +139,32 @@ class AppConfig:
             if value is None or (isinstance(value, str) and not value.strip()):
                 continue
             setattr(self, key, value)
+
+
+PREVIEW_CACHE_FOLDER = ".svscloud-preview"
+
+
+def preview_cache_path_for(cache_dir: str, download_dir: str) -> Path:
+    """Где окажется кэш превью при таких настройках (для показа в «Настройках»)."""
+    base = Path((cache_dir or "").strip() or download_dir).expanduser()
+    return base / PREVIEW_CACHE_FOLDER
+
+
+def _repair_download_dir(cfg: AppConfig) -> None:
+    """Папка загрузок во временной папке Windows — это не выбор пользователя.
+
+    Так случалось, когда временная (тестовая) конфигурация попадала в файл
+    настроек: файлы уезжали бы в Temp, который Windows сама чистит.
+    """
+    try:
+        temp = Path(tempfile.gettempdir()).resolve()
+        current = Path(cfg.download_dir).expanduser().resolve()
+    except (OSError, ValueError):
+        return
+    if current == temp or temp in current.parents:
+        default = str(default_download_dir())
+        log.warning("Папка загрузок указывала во временную (%s) — вернули %s", current, default)
+        cfg.download_dir = default
 
 
 def _apply_env_overrides(cfg: AppConfig) -> None:

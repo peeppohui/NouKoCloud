@@ -21,8 +21,10 @@ EXCLUDES = [
     "PySide6.QtQml", "PySide6.QtQuick", "PySide6.QtQuick3D", "PySide6.QtQuickWidgets",
     "PySide6.Qt3DCore", "PySide6.Qt3DRender", "PySide6.Qt3DInput", "PySide6.Qt3DLogic",
     "PySide6.Qt3DAnimation", "PySide6.Qt3DExtras", "PySide6.QtCharts", "PySide6.QtDataVisualization",
-    "PySide6.QtMultimedia", "PySide6.QtMultimediaWidgets", "PySide6.QtOpenGL",
-    "PySide6.QtOpenGLWidgets", "PySide6.QtSql", "PySide6.QtTest", "PySide6.QtDesigner",
+    # Превью играет QtMultimedia (FFmpeg внутри), а не браузер: Chromium из
+    # QtWebEngine собран без H.264/AAC и весит ~150 МБ — исключаем его целиком.
+    "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets", "PySide6.QtWebEngineQuick",
+    "PySide6.QtPdf", "PySide6.QtPdfWidgets", "PySide6.QtSql", "PySide6.QtTest", "PySide6.QtDesigner",
     "PySide6.QtBluetooth", "PySide6.QtNfc", "PySide6.QtPositioning", "PySide6.QtLocation",
     "PySide6.QtSerialPort", "PySide6.QtSensors", "PySide6.QtWebSockets", "PySide6.QtWebChannel",
     "tkinter", "unittest", "pydoc_data", "test",
@@ -31,10 +33,12 @@ EXCLUDES = [
 ]
 
 datas = []
-# Данные PySide6 (переводы, плагины, Chromium) собирает сам hook PyInstaller.
+# Данные PySide6 (переводы, плагины, FFmpeg) собирает сам hook PyInstaller.
 # collect_data_files("PySide6") тащил бы ВСЁ — из-за этого сборка весила 650 МБ.
 datas += [
     (str(ROOT / "docs"), "docs"),
+    # Иконки флажков дерева (галочка/чёрточка) — их читает таблица стилей.
+    (str(ROOT / "app" / "ui" / "icons"), "app/ui/icons"),
 ]
 
 hiddenimports = [
@@ -43,10 +47,10 @@ hiddenimports = [
     "httpcore",
     "h11",
     "win32crypt",
-    "PySide6.QtWebEngineCore",
-    "PySide6.QtWebEngineWidgets",
-    "PySide6.QtWebChannel",
-    "PySide6.QtPrintSupport",
+    # Плеер превью: QtMultimedia тянет плагин ffmpegmediaplugin и avcodec/avformat.
+    "PySide6.QtMultimedia",
+    "PySide6.QtMultimediaWidgets",
+    "PySide6.QtNetwork",
 ]
 hiddenimports += collect_submodules("app")
 
@@ -129,7 +133,10 @@ def _trim_languages(target: Path) -> None:
     removed = 0
     freed = 0
     for item in target.rglob("*"):
-        if not item.is_file() or item.suffix.lower() not in (".qm", ".pak"):
+        # Только переводы Qt (.qm) в папках translations. Раньше сюда попадали
+        # и все .pak — включая qtwebengine_resources.pak, без которого
+        # встроенный браузер (прежний плеер превью) вообще не работал.
+        if not item.is_file() or item.suffix.lower() != ".qm" or item.parent.name != "translations":
             continue
         tokens = re.split(r"[._-]", item.stem)
         if any(token.lower() in ("ru", "en") for token in tokens):
@@ -143,7 +150,7 @@ def _trim_languages(target: Path) -> None:
     print(f"  удалено языковых файлов: {removed} ({freed // (1024 * 1024)} МБ)")
 
     # Пустые каталоги переводов убираем, чтобы не путать при развёртывании.
-    for folder in list(target.rglob("translations")) + list(target.rglob("qtwebengine_locales")):
+    for folder in target.rglob("translations"):
         if folder.is_dir() and not any(folder.iterdir()):
             try:
                 folder.rmdir()

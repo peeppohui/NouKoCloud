@@ -93,7 +93,7 @@ class ProviderRegistry:
         return provider, ctx, [single]
 
     async def _google_metadata(self, file_id: str) -> dict:
-        params = {"fields": "id,name,mimeType,driveId,resourceKey,size,capabilities(canDownload)", "supportsAllDrives": "true"}
+        params = {"fields": "id,name,mimeType,driveId,resourceKey,size,modifiedTime,md5Checksum,capabilities(canDownload)", "supportsAllDrives": "true"}
         headers: dict[str, str] = {}
         if self._config.google_api_key:
             params["key"] = self._config.google_api_key
@@ -130,6 +130,7 @@ class ProviderRegistry:
             size=int(meta.get("size") or 0),
             mime=meta.get("mimeType", ""),
             modified=modified_dt,
+            md5=meta.get("md5Checksum"),
             source=ctx.source,
             drive_id=meta.get("driveId"),
             resource_key=meta.get("resourceKey"),

@@ -70,7 +70,9 @@ class FfmpegTools:
         """Достаёт длительность из вывода ffmpeg."""
         if not self._path:
             return None
-        args = ["-hide_banner", "-i", url, *self._headers_arg(headers or {}), "-f", "null", "-"]
+        # -headers — опция входа: она обязана стоять ПЕРЕД -i, иначе
+        # относится к выходному файлу и в облако не уходит.
+        args = ["-hide_banner", *self._headers_arg(headers or {}), "-i", url, "-f", "null", "-"]
         try:
             _code, _out, err = await self._run(args, timeout=60)
         except Exception as exc:
@@ -97,7 +99,7 @@ class FfmpegTools:
         args = [
             "-hide_banner", "-loglevel", "error",
             "-ss", f"{max(0.0, at_seconds):.2f}",
-            "-i", url, *self._headers_arg(headers or {}),
+            *self._headers_arg(headers or {}), "-i", url,
             "-frames:v", "1", "-q:v", "3", "-y", str(out_path),
         ]
         try:
@@ -118,7 +120,7 @@ class FfmpegTools:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         args = [
             "-hide_banner", "-loglevel", "error",
-            "-i", url, *self._headers_arg(headers or {}),
+            *self._headers_arg(headers or {}), "-i", url,
             "-t", str(max(5, seconds)),
             "-vf", f"scale=-2:{max(144, max_height // 2) * 2}",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",

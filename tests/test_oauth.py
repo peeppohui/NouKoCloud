@@ -38,7 +38,7 @@ class TestYandexOAuth(unittest.TestCase):
 
         with self.assertRaises(AuthError) as ctx:
             asyncio.run(self.oauth.exchange_code("не цифры"))
-        self.assertIn("7 цифр", ctx.exception.user_message)
+        self.assertIn("не похоже на код", ctx.exception.user_message)
 
     def test_empty_code(self) -> None:
         import asyncio
@@ -49,7 +49,7 @@ class TestYandexOAuth(unittest.TestCase):
     def test_error_texts(self) -> None:
         cases = {
             "invalid_grant": "Код не подошёл",
-            "bad_verification_code": "7 цифр",
+            "bad_verification_code": "Код введён неверно",
             "invalid_client": "Ключи приложения неверны",
             "invalid_scope": "нет прав на Яндекс.Диск",
         }

@@ -111,6 +111,22 @@ class MockYandexHandler(BaseHTTPRequestHandler):
             if not key.startswith("https://disk.yandex.ru/d/"):
                 self._json({"message": "Resource not found", "error": "NotFound"}, 404)
                 return
+            if key.endswith("PRIVATE"):
+                if not self.headers.get("Authorization"):
+                    self._json({"message": "Resource not found", "error": "NotFound"}, 404)
+                    return
+                self._json({
+                    "name": "Исходники клиента",
+                    "path": "/",
+                    "type": "dir",
+                    "_embedded": {"items": [{"name": "A001.MOV", "type": "file", "path": "/A001.MOV",
+                                             "size": 10, "mime_type": "video/quicktime"}],
+                                  "limit": 1000, "offset": 0, "total": 1, "path": "/"},
+                })
+                return
+            if key.endswith("GONE"):
+                self._json({"message": "Resource not found", "error": "NotFound"}, 404)
+                return
             if key.endswith("SINGLEFILE"):
                 # Публичная ссылка сразу на файл, а не на папку
                 self._json({
@@ -128,6 +144,15 @@ class MockYandexHandler(BaseHTTPRequestHandler):
                 "type": "dir",
                 "_embedded": {"items": [], "limit": 1000, "offset": 0, "total": 0, "path": "/"},
             })
+            return
+
+        if parsed.path == "/v1/disk/public/resources/download":
+            key = (params.get("public_key") or [""])[0]
+            if key.endswith("PRIVATE") and not self.headers.get("Authorization"):
+                self._json({"message": "Resource not found", "error": "NotFound"}, 404)
+                return
+            host = self.headers.get("Host", "127.0.0.1")
+            self._json({"href": f"http://{host}/download/clip.mp4", "method": "GET"})
             return
 
         if parsed.path == "/v1/disk/resources/download":
@@ -170,8 +195,13 @@ class MockYandexHandler(BaseHTTPRequestHandler):
 
 
 class FakeOAuth:
+    logged_in = False
+
     async def access_token(self, pid):
         return "fake-token"
+
+    def is_logged_in(self, pid) -> bool:
+        return self.logged_in
 
 
 class FakeRegistry:
@@ -288,7 +318,45 @@ class TestYandexIntegration(unittest.IsolatedAsyncioTestCase):
         ctx = BrowseContext(source=SourceKind.PUBLIC, public_key="short-key")
         with self.assertRaises(NotFoundError) as ctx_error:
             await self.provider.list_children(ctx, None)
-        self.assertIn("не даёт доступ", ctx_error.exception.user_message)
+        message = ctx_error.exception.user_message
+        self.assertIn("ничего нет", message)
+        self.assertIn("инкогнито", message, "подсказываем, как проверить ссылку")
+
+    async def test_public_folder_gets_its_real_name(self) -> None:
+        ctx = BrowseContext(source=SourceKind.PUBLIC, public_key="https://disk.yandex.ru/d/AbCdEf12",
+                            display_name="Яндекс.Диск · AbCdEf12")
+        await self.provider.list_children(ctx, None)
+        self.assertEqual(ctx.display_name, "public", "название папки — из ответа Яндекса")
+
+    async def test_link_shared_personally_opens_with_login(self) -> None:
+        """Без входа 404, но пользователь вошёл — открываем от его имени (список, скачивание)."""
+        self.provider.oauth.logged_in = True
+        ctx = BrowseContext(source=SourceKind.PUBLIC, public_key="https://disk.yandex.ru/d/PRIVATE")
+        items = await self.provider.list_children(ctx, None)
+        self.assertEqual([i.name for i in items], ["A001.MOV"])
+        self.assertEqual(ctx.display_name, "Исходники клиента")
+        link = await self.provider.resolve_download(items[0])
+        self.assertTrue(link.url.endswith("/download/clip.mp4"))
+
+    async def test_link_shared_personally_without_login(self) -> None:
+        self.provider.oauth.logged_in = False
+        ctx = BrowseContext(source=SourceKind.PUBLIC, public_key="https://disk.yandex.ru/d/PRIVATE")
+        with self.assertRaises(NotFoundError) as error:
+            await self.provider.list_children(ctx, None)
+        self.assertIn("войдите в Яндекс", error.exception.user_message)
+
+    async def test_dead_link_even_with_login(self) -> None:
+        self.provider.oauth.logged_in = True
+        ctx = BrowseContext(source=SourceKind.PUBLIC, public_key="https://disk.yandex.ru/d/GONE")
+        with self.assertRaises(NotFoundError) as error:
+            await self.provider.list_children(ctx, None)
+        self.assertIn("даже для вашего аккаунта", error.exception.user_message)
+
+    async def test_link_to_subfolder_passes_path(self) -> None:
+        ctx = BrowseContext(source=SourceKind.PUBLIC, public_key="https://disk.yandex.ru/d/AbCdEf12",
+                            root_path="/Съёмка")
+        await self.provider.list_children(ctx, None)
+        self.assertEqual(MockYandexHandler.last_request.get("path"), "/Съёмка")
 
     async def test_public_single_file(self) -> None:
         """Ссылка сразу на файл — показываем его единственным элементом."""

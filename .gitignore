@@ -35,3 +35,7 @@ cache.db
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Собранная программа в корне (кладётся после сборки)
+/svsCloud.exe
+/_internal/

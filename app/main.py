@@ -46,8 +46,6 @@ def main(argv: list[str] | None = None) -> int:
         if index + 1 < len(argv):
             start_url = argv[index + 1]
 
-    # QtWebEngine требует общий OpenGL-контекст — задаём до создания QApplication.
-    QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)
 
     app = QApplication(argv)

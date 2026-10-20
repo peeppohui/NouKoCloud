@@ -89,6 +89,12 @@ class CloudProvider(ABC):
         )
 
     def remember_link(self, file: CloudFile, link: DownloadLink) -> None:
+        # Кэш не зашифрован — токены авторизации в него не кладём.
+        headers = {k: v for k, v in link.headers.items() if k.lower() != "authorization"}
         self.cache.put_link(
-            self._cache_key(file), link.url, link.headers, link.size, link.expires_at
+            self._cache_key(file), link.url, headers, link.size, link.expires_at
         )
+
+    def forget_link(self, file: CloudFile) -> None:
+        """Выбрасывает ссылку из кэша (облако её отвергло)."""
+        self.cache.drop_link(self._cache_key(file))

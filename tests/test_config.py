@@ -54,6 +54,14 @@ class TestPortableConfig(unittest.TestCase):
         # а непустое — затирает
         self.assertEqual(cfg.download_dir, str(self.tmp))
 
+    def test_portable_config_with_bom(self) -> None:
+        """build.ps1 (Windows PowerShell 5) пишет config.json с BOM."""
+        portable = self.tmp / "config.json"
+        portable.write_text(json.dumps({"yandex_client_id": "bom-id"}), encoding="utf-8-sig")
+        cfg = AppConfig()
+        cfg._apply_file(portable)
+        self.assertEqual(cfg.yandex_client_id, "bom-id")
+
     def test_no_portable_config_is_fine(self) -> None:
         paths.portable_config_path = lambda: None
         cfg = AppConfig()

@@ -31,12 +31,16 @@ class LoopbackRedirectServer:
         self._host = host
         self._server: asyncio.AbstractServer | None = None
         self._future: asyncio.Future[str] | None = None
+        self._port = 0
 
     @property
     def port(self) -> int:
-        if self._server is None or not self._server.sockets:
+        # Порт запоминаем при старте: redirect_uri нужен и ПОСЛЕ остановки
+        # сервера — при обмене кода на токен (Google сверяет его с тем, что
+        # был в запросе авторизации). Раньше здесь падало «Сервер не запущен».
+        if not self._port:
             raise RuntimeError("Сервер не запущен")
-        return int(self._server.sockets[0].getsockname()[1])
+        return self._port
 
     @property
     def redirect_uri(self) -> str:
@@ -46,6 +50,7 @@ class LoopbackRedirectServer:
         loop = asyncio.get_running_loop()
         self._future = loop.create_future()
         self._server = await asyncio.start_server(self._handle, self._host, 0)
+        self._port = int(self._server.sockets[0].getsockname()[1])
 
     async def wait_for_code(self, timeout: float = 300.0) -> str:
         if self._future is None:
@@ -79,7 +84,7 @@ class LoopbackRedirectServer:
             if error:
                 title, text = "Не удалось войти", f"Облако ответило ошибкой: {error}"
             elif code:
-                title, text = "Готово", "Войдите выполнено. Можно возвращаться в приложение."
+                title, text = "Готово", "Вход выполнен. Можно возвращаться в приложение."
             else:
                 title, text = "Пустая страница", "Ожидался код авторизации."
 

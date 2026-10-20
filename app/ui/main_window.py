@@ -6,8 +6,9 @@ import logging
 import os
 import subprocess
 import sys
+from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -27,7 +28,7 @@ from ..core.errors import friendly_error
 from ..core.models import CloudFile, ProviderId, SourceKind
 from ..core.paths import logs_dir
 from ..providers.base import BrowseContext
-from ..preview.server import browser_can_play
+from ..preview.stream_cache import cache_usage, clear_directory
 from .auth_dialog import AuthDialog
 from .file_tree import FileTree
 from .preview_panel import PreviewPanel
@@ -46,12 +47,80 @@ def _human_size(size: int) -> str:
 
 log = logging.getLogger(__name__)
 
+# Картинки скачиваются для превью целиком — огромные TIFF не тянем.
+IMAGE_PREVIEW_LIMIT = 200 * 1024 * 1024
+
+
+class _GuiInvoker(QObject):
+    """Выполняет функцию в GUI-потоке.
+
+    Колбэки concurrent.Future вызываются в фоновом asyncio-потоке, а виджеты
+    Qt можно трогать только из главного. Сигнал с QueuedConnection
+    переносит вызов в очередь событий GUI.
+    """
+
+    call = Signal(object)
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self.call.connect(self._run, Qt.ConnectionType.QueuedConnection)
+
+    @staticmethod
+    def _run(fn) -> None:
+        fn()
+
+
+class _PreviewCacheOps:
+    """Операции с кэшем превью для окна «Настройки».
+
+    Очистку делает главное окно: перед удалением файлов нужно остановить
+    плеер и закрыть открытые кэши — Windows не даёт удалять открытые файлы.
+    """
+
+    def __init__(self, window: "MainWindow") -> None:
+        self._window = window
+
+    def usage(self, path: Path) -> tuple[int, int]:
+        return cache_usage(path)
+
+    def clear(self, path: Path) -> tuple[int, int]:
+        win = self._window
+        win.preview_panel.stop()
+        if win._preview_token:
+            win.ctx.preview.drop_session(win._preview_token)
+            win._preview_token = None
+            win._preview_key = None
+        try:
+            win.ctx.runtime.submit(win.ctx.preview.close_caches()).result(timeout=10)
+        except Exception:
+            log.warning("Кэши превью не закрылись перед очисткой", exc_info=True)
+        freed, failed = clear_directory(path)
+        log.info("Кэш превью очищен: %s (освобождено %d байт, не удалено %d)", path, freed, failed)
+        return freed, failed
+
+    def open_folder(self, path: Path) -> None:
+        path.mkdir(parents=True, exist_ok=True)
+        if sys.platform == "win32":
+            os.startfile(str(path))  # noqa: S606
+        else:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
 
 class MainWindow(QMainWindow):
     def __init__(self, ctx: AppContext) -> None:
         super().__init__()
         self.ctx = ctx
         self._preview_token: str | None = None
+        self._preview_key: tuple | None = None   # какой файл сейчас в превью
+        self._proxy_tried: set[str] = set()      # токены, для которых уже делали копию ffmpeg
+        # Выбор файла стрелками/кликом: превью с небольшой задержкой, чтобы
+        # быстрый проход по списку не дёргал облако на каждом файле.
+        self._pending_preview: CloudFile | None = None
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(350)
+        self._preview_timer.timeout.connect(self._preview_pending)
+        self._invoker = _GuiInvoker(self)
         self.setWindowTitle("svsCloud — облачные исходники для монтажа")
         self.resize(1280, 820)
         self.setStyleSheet(STYLESHEET)
@@ -78,7 +147,9 @@ class MainWindow(QMainWindow):
         self.tree = FileTree(left)
         self.tree._loader = self._load_children
         self.tree.children_loaded.connect(self.tree.handle_children_loaded)
-        self.tree.file_activated.connect(self._show_preview)
+        self.tree.file_activated.connect(self._activate_preview)
+        self.tree.file_selected.connect(self._on_file_selected)
+        self.tree.open_drive_requested.connect(self._open_my_drive_for)
         self.tree.checked_changed.connect(self._on_checked_changed)
         left_layout.addWidget(self.tree, 1)
 
@@ -103,6 +174,7 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget(splitter)
         self.preview_panel = PreviewPanel(self.tabs)
         self.preview_panel.download_requested.connect(self._download_one)
+        self.preview_panel.player.failed.connect(self._on_preview_failed)
         self.tabs.addTab(self.preview_panel, "Превью")
         self.queue_view = QueueView(self.tabs)
         self.queue_view.pause_requested.connect(self._engine_call(self.ctx.engine.pause))
@@ -111,6 +183,7 @@ class MainWindow(QMainWindow):
         self.queue_view.remove_requested.connect(self._engine_call(self.ctx.engine.remove))
         self.queue_view.open_folder_requested.connect(self._open_download_dir)
         self.tabs.addTab(self.queue_view, "Очередь")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         splitter.addWidget(self.tabs)
         splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 3)
@@ -164,6 +237,13 @@ class MainWindow(QMainWindow):
         self.statusBar().addAction(action)
 
     # ------------------------------------------------------------------
+    def _in_gui(self, handler):
+        """Оборачивает колбэк Future так, чтобы он выполнился в GUI-потоке."""
+        def callback(future) -> None:
+            self._invoker.call.emit(lambda: handler(future))
+
+        return callback
+
     def _engine_call(self, func):
         """Вызывает метод движка в его потоке (asyncio.Event не потокобезопасен)."""
         def wrapper(*args) -> None:
@@ -183,7 +263,7 @@ class MainWindow(QMainWindow):
     def _after_start(self) -> None:
         """Действия после запуска фонового цикла."""
         future = self.ctx.runtime.submit(self.ctx.startup())
-        future.add_done_callback(self._on_startup_done)
+        future.add_done_callback(self._in_gui(self._on_startup_done))
         self._recover_downloads()
 
     def _on_startup_done(self, future) -> None:
@@ -192,11 +272,16 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             log.error("Ошибка запуска: %s", exc, exc_info=True)
             self._on_notice("error", "Не удалось запустить фоновые задачи. Перезапустите программу.")
+            return
+        # «Мой диск» каждого облака, где выполнен вход, открыт сразу.
+        for pid in (ProviderId.YANDEX, ProviderId.GOOGLE):
+            if self.ctx.oauth.is_logged_in(pid):
+                self._open_my_drive_for(pid, interactive=False)
 
     def _recover_downloads(self) -> None:
         dest = self.ctx.config.download_dir_path
         future = self.ctx.runtime.submit(self.ctx.engine.recover(dest))
-        future.add_done_callback(lambda fut: self._after_recover(fut))
+        future.add_done_callback(self._in_gui(self._after_recover))
 
     def _after_recover(self, future) -> None:
         try:
@@ -238,21 +323,26 @@ class MainWindow(QMainWindow):
 
     def _on_logged_in(self, pid: str, name: str) -> None:
         self._on_notice("info", f"Вход выполнен: {name}")
+        try:
+            provider = ProviderId(pid)
+        except ValueError:
+            return
+        self._open_my_drive_for(provider, interactive=False)
 
     # ------------------------------------------------------------------
     def _load_children(self, file: CloudFile, ctx: BrowseContext, done) -> None:
         """Асинхронная загрузка содержимого папки."""
         provider = self.ctx.registry.get(file.provider)
         future = self.ctx.runtime.submit(provider.list_children(ctx, file))
-        future.add_done_callback(lambda fut: self._deliver(fut, done))
+        future.add_done_callback(self._in_gui(lambda fut: self._deliver(fut, done, file.provider.value)))
 
-    def _deliver(self, future, done) -> None:
+    def _deliver(self, future, done, provider: str) -> None:
         try:
             files = future.result()
         except Exception as exc:
             log.warning("Не удалось загрузить папку: %s", exc)
-            self._on_notice("error", friendly_error(exc, provider="yandex"))
-            done([])
+            self._on_notice("error", friendly_error(exc, provider=provider))
+            done(None)   # None — ошибка: дерево даст раскрыть папку повторно
         else:
             done(files)
 
@@ -264,7 +354,7 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _open_settings(self) -> None:
-        dialog = SettingsDialog(self.ctx.config, self)
+        dialog = SettingsDialog(self.ctx.config, self, cache_ops=_PreviewCacheOps(self))
         if dialog.exec() == SettingsDialog.DialogCode.Accepted:
             self.ctx.oauth.reload_config()
             self._on_notice("info", "Настройки сохранены")
@@ -285,9 +375,10 @@ class MainWindow(QMainWindow):
         self._open_url(url.strip())
 
     def _open_url(self, url: str) -> None:
+        log.info("Открываем ссылку (как вставлена): %r", url)
         self._on_notice("info", "Открываем ссылку…")
         future = self.ctx.runtime.submit(self.ctx.registry.open_link(url))
-        future.add_done_callback(self._after_open)
+        future.add_done_callback(self._in_gui(self._after_open))
 
     def _after_open(self, future) -> None:
         try:
@@ -297,7 +388,7 @@ class MainWindow(QMainWindow):
             self._on_notice("error", friendly_error(exc))
             return
         title = ctx.display_name or provider.display_name
-        root = self.tree.add_root(title, ctx, provider.display_name)
+        root = self.tree.add_root(title, ctx, provider.display_name, provider=provider.id)
         self.tree.set_children(root, items)
         self.tree.expand_item(root)
         if items:
@@ -314,16 +405,26 @@ class MainWindow(QMainWindow):
         name, ok = QInputDialog.getItem(self, "Мой диск", "Какой диск открыть?", names, 0, False)
         if not ok:
             return
-        pid = dict(choices)[name]
+        self._open_my_drive_for(dict(choices)[name])
+
+    def _open_my_drive_for(self, pid: ProviderId, interactive: bool = True) -> None:
+        """Загружает «Мой диск» облака в его постоянный пункт дерева.
+
+        interactive=False — автоматически (при запуске, после входа):
+        без окна «Аккаунты».
+        """
         if not self.ctx.oauth.is_logged_in(pid):
-            self._on_notice("warn", "Сначала войдите в аккаунт (кнопка «Аккаунты»).")
-            self._open_accounts()
+            if interactive:
+                self._on_notice("warn", "Сначала войдите в аккаунт (кнопка «Аккаунты»).")
+                self._open_accounts()
             if not self.ctx.oauth.is_logged_in(pid):
+                self.tree.drive_failed(pid, "войдите в аккаунт («Аккаунты») и раскройте снова")
                 return
+        self.tree.set_drive_loading(pid)
         ctx = BrowseContext(source=SourceKind.OAUTH, root_path="/", display_name="Мой диск")
         provider = self.ctx.registry.get(pid)
         future = self.ctx.runtime.submit(provider.list_children(ctx, None))
-        future.add_done_callback(lambda fut: self._after_my_drive(pid, fut))
+        future.add_done_callback(self._in_gui(lambda fut: self._after_my_drive(pid, fut)))
 
     def _after_my_drive(self, pid: ProviderId, future) -> None:
         try:
@@ -331,9 +432,10 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             log.warning("Не удалось открыть «Мой диск»: %s", exc)
             self._on_notice("error", friendly_error(exc, provider=pid.value))
+            self.tree.drive_failed(pid, "не загрузилось — сверните и раскройте снова")
             return
         ctx = BrowseContext(source=SourceKind.OAUTH, root_path="/", display_name="Мой диск")
-        root = self.tree.add_root("Мой диск", ctx)
+        root = self.tree.add_root("Мой диск", ctx, provider=pid)
         self.tree.set_children(root, items)
         self.tree.expand_item(root)
         self._on_notice("info", f"«Мой диск» открыт: {len(items)} объектов")
@@ -370,7 +472,7 @@ class MainWindow(QMainWindow):
     def _download_files(self, files: list[CloudFile]) -> None:
         dest = self.ctx.config.download_dir_path
         future = self.ctx.runtime.submit(self.ctx.engine.enqueue(files, dest))
-        future.add_done_callback(self._after_enqueue)
+        future.add_done_callback(self._in_gui(self._after_enqueue))
 
     def _after_enqueue(self, future) -> None:
         try:
@@ -382,27 +484,97 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentIndex(1)
         self._on_notice("info", f"В очереди: {len(jobs)} файл(ов). Куда: {self.ctx.config.download_dir}")
     # ------------------------------------------------------------------
+    def _on_file_selected(self, file: CloudFile) -> None:
+        """Курсор встал на файл: показываем превью, если вкладка «Превью» открыта."""
+        if self.tabs.currentWidget() is not self.preview_panel:
+            return
+        self._pending_preview = file
+        self._preview_timer.start()
+
+    def _on_tab_changed(self, _index: int) -> None:
+        # Вернулись на «Превью», а курсор стоит на другом файле — показываем его.
+        if self.tabs.currentWidget() is self.preview_panel:
+            file = self.tree.current_file()
+            if file is not None:
+                self._show_preview(file)
+
+    def _preview_pending(self) -> None:
+        file, self._pending_preview = self._pending_preview, None
+        if file is not None:
+            self._show_preview(file)
+
+    def _activate_preview(self, file: CloudFile) -> None:
+        """Двойной клик / Enter: открываем вкладку «Превью» и показываем файл."""
+        self._preview_timer.stop()
+        self._pending_preview = None
+        self.tabs.setCurrentWidget(self.preview_panel)
+        self._show_preview(file)
+
+    @staticmethod
+    def _file_key(file: CloudFile) -> tuple:
+        return (file.provider.value, file.source.value, file.file_id, file.path)
+
     def _show_preview(self, file: CloudFile) -> None:
+        key = self._file_key(file)
+        if key == self._preview_key and self._preview_token:
+            return  # этот файл уже в превью — не перезапускаем его с начала
+        self.preview_panel.stop()  # закрываем соединения прежнего файла
         if self._preview_token:
             self.ctx.preview.drop_session(self._preview_token)
         session = self.ctx.preview.add_session(file)
         self._preview_token = session.token
-        note = ""
-        if not browser_can_play(file):
-            if self.ctx.ffmpeg.available:
-                note = "Формат не показывается в браузере — готовим облегчённую копию."
-                self._build_proxy(file, session)
-            else:
-                note = "Этот формат нельзя показать без ffmpeg. Скачайте файл, чтобы посмотреть его."
-        self.preview_panel.show_file(file, self.ctx.preview.player_url(session.token), note)
+        self._preview_key = key
 
-    def _build_proxy(self, file: CloudFile, session) -> None:
+        message = ""
+        if not file.can_download:
+            message = "Владелец запретил скачивание этого файла — превью недоступно."
+        elif session.media_kind == "image" and file.size > IMAGE_PREVIEW_LIMIT:
+            message = (
+                f"Изображение слишком большое для превью ({_human_size(file.size)}). "
+                "Скачайте файл, чтобы посмотреть его."
+            )
+        token, size, preview = session.token, file.size, self.ctx.preview
+        self.preview_panel.show_file(
+            file,
+            preview.media_url(token),
+            session.media_kind,
+            autoplay=self.ctx.config.preview_autoplay,
+            message=message,
+            # Сколько уже скачано впереди позиции — для плавной буферизации.
+            buffer_probe=lambda fraction: preview.buffer_state(token, int(fraction * size)),
+        )
+
+    def _on_preview_failed(self, message: str, format_problem: bool) -> None:
+        """Плеер не открыл файл. Если дело в формате и есть ffmpeg — делаем облегчённую копию."""
+        token = self._preview_token
+        session = self.ctx.preview.get_session(token) if token else None
+        if session is None:
+            return
+        if (
+            format_problem
+            and session.media_kind in ("video", "audio")
+            and self.ctx.ffmpeg.available
+            and token not in self._proxy_tried
+        ):
+            self._proxy_tried.add(token)
+            self.preview_panel.player.show_message(
+                "Плеер не открыл этот формат — готовим облегчённую копию (первые "
+                f"{self.ctx.config.preview_proxy_seconds} с)…"
+            )
+            self._build_proxy(session)
+            return
+        self._on_notice("error", f"Превью: {message}")
+
+    def _build_proxy(self, session) -> None:
+        token = session.token
+        # Источник — наш же сервер превью: он сам ходит в облако с нужными
+        # токенами, поэтому ffmpeg не нужны заголовки авторизации.
+        source = self.ctx.preview.media_url(token)
+        out = self.ctx.preview.cache_dir / f"{token}.mp4"
+
         async def job() -> bool:
-            provider = self.ctx.registry.get(file.provider)
-            link = await provider.resolve_download(file)
-            out = self.ctx.config.download_dir_path / ".svscloud-preview" / f"{session.token}.mp4"
             ok = await self.ctx.ffmpeg.build_proxy(
-                link.url, link.headers, out,
+                source, None, out,
                 max_height=self.ctx.config.preview_max_height,
                 seconds=self.ctx.config.preview_proxy_seconds,
             )
@@ -411,16 +583,27 @@ class MainWindow(QMainWindow):
             return ok
 
         future = self.ctx.runtime.submit(job())
-        future.add_done_callback(self._after_proxy)
+        future.add_done_callback(self._in_gui(lambda fut: self._after_proxy(fut, token)))
 
-    def _after_proxy(self, future) -> None:
+    def _after_proxy(self, future, token: str) -> None:
         try:
             ok = future.result()
         except Exception as exc:
             log.info("Облегчённая копия не удалась: %s", exc)
+            ok = False
+        if token != self._preview_token:
+            return  # пользователь уже смотрит другой файл
+        session = self.ctx.preview.get_session(token)
+        if not ok or session is None:
+            self.preview_panel.player.show_message(
+                "Этот формат нельзя показать в превью. Скачайте файл, чтобы посмотреть его."
+            )
             return
-        if ok:
-            self._on_notice("info", "Превью готово.")
+        self.preview_panel.player.play(
+            self.ctx.preview.proxy_url(token), "video", session.file.name,
+            autoplay=self.ctx.config.preview_autoplay,
+        )
+        self._on_notice("info", "Превью готово (облегчённая копия).")
 
     # ------------------------------------------------------------------
     def _open_download_dir(self) -> None:
@@ -439,6 +622,11 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------
     def closeEvent(self, event) -> None:  # noqa: N802
+        # Сначала закрываем плеер — иначе его соединения держат сервер превью.
+        try:
+            self.preview_panel.stop()
+        except Exception:
+            pass
         try:
             self.ctx.config.window_geometry = self.saveGeometry().toBase64().data().decode()
             self.ctx.config.save()

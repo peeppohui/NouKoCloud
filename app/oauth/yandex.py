@@ -4,7 +4,8 @@
 * адрес выдачи кода — `https://oauth.yandex.com/verification_code`;
   именно его надо указать в поле «Redirect URI» приложения
   (для приложений «For API access» он задан жёстко и не меняется);
-* код подтверждения — **7 цифр**, живёт 10 минут;
+* код подтверждения живёт 10 минут; раньше это были 7 цифр, сейчас —
+  строка из латинских букв и цифр;
 * если `scope` не передавать, токен выдаётся с теми правами,
   которые заданы при регистрации приложения (так надёжнее всего);
 * ошибки приходят в формате `{"error": "...", "error_description": "..."}`;
@@ -17,12 +18,13 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 
-from ..core.errors import AuthError
+from ..core.errors import AuthError, ServerError
 from ..core.models import ProviderId
 from .base import OAuthProvider, OAuthTokens
 
@@ -39,6 +41,25 @@ REDIRECT_URIS = (
     "https://oauth.yandex.ru/redirect",
 )
 
+#: Код подтверждения: раньше Яндекс выдавал 7 цифр, сейчас — строку из
+#: латинских букв и цифр (например, 16 символов). Принимаем оба вида.
+_CODE_RE = re.compile(r"[A-Za-z0-9]{4,64}")
+
+
+def normalize_code(text: str) -> str:
+    """Достаёт код из вставленного текста.
+
+    Пользователь может скопировать код с пробелами/переводом строки
+    или целиком адрес страницы `...verification_code?code=XXXX`.
+    """
+    text = (text or "").strip()
+    if "code=" in text:
+        values = parse_qs(urlparse(text).query).get("code") or parse_qs(text.split("?", 1)[-1]).get("code")
+        if values:
+            text = values[0]
+    return "".join(text.split())
+
+
 #: Права по умолчанию НЕ запрашиваем: Яндекс выдаст те, что заданы
 #: при регистрации приложения (иначе можно нарваться на invalid_scope).
 DEFAULT_SCOPES: tuple[str, ...] = ()
@@ -46,7 +67,7 @@ DEFAULT_SCOPES: tuple[str, ...] = ()
 _ERROR_TEXT = {
     "invalid_grant": "Код не подошёл: он мог истечь (код живёт 10 минут). "
                      "Попросите новый код в браузере.",
-    "bad_verification_code": "Код введён неверно — Яндекс ожидает 7 цифр.",
+    "bad_verification_code": "Код введён неверно. Скопируйте его целиком со страницы Яндекса.",
     "invalid_client": "Ключи приложения неверны. Проверьте Client ID и Client Secret в настройках.",
     "invalid_scope": "У приложения нет прав на Яндекс.Диск. "
                      "Включите «Чтение диска» в настройках приложения на oauth.yandex.com.",
@@ -92,27 +113,25 @@ class YandexOAuth(OAuthProvider):
 
     # ------------------------------------------------------------------
     async def exchange_code(self, code: str, redirect_uri: str = REDIRECT_URIS[0]) -> OAuthTokens:
-        code = code.strip()
+        code = normalize_code(code)
         if not code:
             raise AuthError("Код авторизации пустой. Скопируйте его со страницы Яндекса.")
-        if not code.isdigit():
+        if not _CODE_RE.fullmatch(code):
             raise AuthError(
-                "Код авторизации — это 7 цифр. Скопируйте его целиком со страницы Яндекса."
+                "Это не похоже на код подтверждения. Скопируйте код целиком "
+                "со страницы Яндекса (только буквы и цифры)."
             )
 
-        # Redirect URI должен совпадать с тем, что был указан при авторизации.
-        # Пробуем основной, а на всякий случай и запасные.
-        candidates = [redirect_uri] + [uri for uri in REDIRECT_URIS if uri != redirect_uri]
-        last_error: Exception | None = None
-        for uri in candidates:
-            try:
-                return await self._exchange(code, uri)
-            except AuthError as exc:
-                last_error = exc
-                log.info("Обмен кода не удался с %s: %s", uri, exc.technical)
-        raise last_error or AuthError("Яндекс не принял код авторизации.")
+        # redirect_uri Яндекс при обмене кода не требует, поэтому повторять
+        # запрос с «запасными» адресами бессмысленно: тот же код ушёл бы
+        # трижды, а пользователь увидел бы ошибку последней попытки.
+        try:
+            return await self._exchange(code)
+        except AuthError as exc:
+            log.info("Обмен кода не удался: %s", exc.technical)
+            raise
 
-    async def _exchange(self, code: str, redirect_uri: str) -> OAuthTokens:
+    async def _exchange(self, code: str) -> OAuthTokens:
         data = {
             "grant_type": "authorization_code",
             "code": code,
@@ -156,8 +175,11 @@ class YandexOAuth(OAuthProvider):
         }
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(TOKEN_URL, data=data)
-        if response.status_code != 200:
+        if response.status_code in (400, 401):
             raise self._error(response)
+        if response.status_code != 200:
+            # Сбой на стороне Яндекса — вход не теряем, повторим позже.
+            raise ServerError(technical=f"refresh Яндекс: {response.status_code}: {response.text[:300]}")
         payload = response.json()
         return OAuthTokens(
             access_token=payload["access_token"],

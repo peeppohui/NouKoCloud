@@ -91,12 +91,53 @@ class YandexProvider(CloudProvider):
     id = ProviderId.YANDEX
     display_name = "Яндекс.Диск"
 
-    #: Что говорить, когда публичная ссылка не открывается анонимно.
-    NOT_PUBLIC_HINT = (
-        "Яндекс не даёт доступ по этой ссылке без входа. "
-        "Если папка открыта вам лично — войдите в аккаунт (кнопка «Аккаунты») "
-        "и откройте её через «Мой диск»."
+    #: Яндекс ответил «ничего нет» (404) на публичную ссылку, входа нет.
+    LINK_NOT_FOUND = (
+        "Яндекс отвечает, что по этой ссылке ничего нет. Так бывает, если ссылку "
+        "удалили или закрыли, если владелец открыл папку только определённым людям "
+        "или если ссылка скопирована не полностью. Откройте её в браузере в режиме "
+        "инкогнито: если и там «Ничего не найдено» — попросите у владельца новую "
+        "ссылку с доступом «Все, у кого есть ссылка». Если доступ дали лично вам — "
+        "войдите в Яндекс («Аккаунты») и откройте ссылку ещё раз."
     )
+    #: То же, но запрос уже повторяли от имени аккаунта пользователя.
+    LINK_NOT_FOUND_LOGGED_IN = (
+        "Яндекс отвечает, что по этой ссылке ничего нет — даже для вашего аккаунта. "
+        "Ссылку удалили или закрыли, либо она скопирована не полностью. Проверьте её "
+        "в браузере в режиме инкогнито и попросите у владельца новую ссылку "
+        "с доступом «Все, у кого есть ссылка»."
+    )
+
+    async def _public_get(self, url: str, params: dict) -> httpx.Response:
+        """Запрос к публичному ресурсу.
+
+        Сначала без входа (так работает любая обычная ссылка). Если Яндекс
+        ответил 404, а пользователь вошёл в Яндекс, — повторяем от его имени:
+        так открываются папки, доступ к которым владелец выдал лично ему.
+        404 после повтора — NotFoundError с понятным объяснением.
+        """
+        try:
+            return await self.http.request("GET", url, provider="yandex", params=params)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 404:
+                raise
+            if not self.oauth.is_logged_in(ProviderId.YANDEX):
+                raise NotFoundError(
+                    self.LINK_NOT_FOUND,
+                    technical=f"404 от Яндекса без входа для {params.get('public_key')}",
+                ) from exc
+        log.info("Ссылка не открылась без входа — пробуем от имени аккаунта Яндекса")
+        try:
+            return await self.http.request(
+                "GET", url, provider="yandex", params=params, headers=await self._auth_headers()
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                raise NotFoundError(
+                    self.LINK_NOT_FOUND_LOGGED_IN,
+                    technical=f"404 от Яндекса и с входом для {params.get('public_key')}",
+                ) from exc
+            raise
 
     # ------------------------------------------------------------------
     async def _auth_headers(self) -> dict[str, str]:
@@ -114,8 +155,8 @@ class YandexProvider(CloudProvider):
             url = f"{API}/public/resources"
             base_params: dict = {"public_key": ctx.public_key or ""}
             headers: dict[str, str] = {}
-            # Для публичной папки путь не указывают — он всегда «/».
-            request_path: Optional[str] = None if parent is None else path
+            # Корень ссылки — без пути; ссылка на подпапку (…?path=/Папка) — с путём.
+            request_path: Optional[str] = None if parent is None and path == "/" else path
         else:
             url = f"{API}/resources"
             base_params = {}
@@ -129,19 +170,18 @@ class YandexProvider(CloudProvider):
         collected: list[CloudFile] = []
         seen_paths: set[str] = set()
 
-        for _ in range(MAX_PAGES):
-            try:
+        for page_no in range(MAX_PAGES):
+            if ctx.source is SourceKind.PUBLIC:
+                response = await self._public_get(url, params)
+            else:
                 response = await self.http.request(
                     "GET", url, provider="yandex", params=params, headers=headers
                 )
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code == 404 and ctx.source is SourceKind.PUBLIC:
-                    raise NotFoundError(
-                        self.NOT_PUBLIC_HINT,
-                        technical=f"404 от Яндекса для {ctx.public_key}",
-                    ) from exc
-                raise
             payload = response.json()
+            if ctx.source is SourceKind.PUBLIC and parent is None and page_no == 0 \
+                    and payload.get("name"):
+                # Настоящее название папки по ссылке — для раздела «Яндекс.Диск».
+                ctx.display_name = str(payload["name"])
             page, total, limit, offset = unpack_listing(payload)
             if not page and not payload.get("_embedded"):
                 # Ссылка ведёт сразу на файл, а не на папку: отдаём его как
@@ -206,25 +246,20 @@ class YandexProvider(CloudProvider):
         if file.source is SourceKind.PUBLIC:
             url = f"{API}/public/resources/download"
             params = {"public_key": file.public_key or "", "path": file.path}
-            headers: dict[str, str] = {}
+            # Без входа, а при 404 — от имени аккаунта (доступ, выданный лично).
+            response = await self._public_get(url, params)
         else:
             url = f"{API}/resources/download"
             params = {"path": disk_path(file.path)}
-            headers = await self._auth_headers()
-
-        try:
-            response = await self.http.request(
-                "GET", url, provider="yandex", params=params, headers=headers
-            )
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 404:
-                if file.source is SourceKind.PUBLIC:
-                    raise NotFoundError(
-                        self.NOT_PUBLIC_HINT,
-                        technical=f"404 от Яндекса для {file.public_key}",
-                    ) from exc
-                raise NotFoundError() from exc
-            raise
+            try:
+                response = await self.http.request(
+                    "GET", url, provider="yandex", params=params,
+                    headers=await self._auth_headers(),
+                )
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 404:
+                    raise NotFoundError() from exc
+                raise
         payload = response.json()
         href = payload.get("href")
         if not href:

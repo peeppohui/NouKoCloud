@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 
 from ..core.errors import friendly_error
 from ..core.models import ProviderId
+from ..oauth.yandex import normalize_code
 
 log = logging.getLogger(__name__)
 
@@ -59,8 +60,11 @@ class AuthDialog(QDialog):
         )
 
         self._yandex_code = QLineEdit(self)
-        self._yandex_code.setPlaceholderText("Вставьте код (7 цифр) и нажмите Enter")
+        self._yandex_code.setPlaceholderText("Вставьте код со страницы Яндекса и нажмите Enter")
         self._yandex_code.setVisible(False)
+        # Подключаем один раз: иначе каждое нажатие «Войти» добавляло бы
+        # ещё один обработчик, и код уходил бы в Яндекс несколько раз.
+        self._yandex_code.returnPressed.connect(self._finish_yandex)
         layout.addWidget(self._yandex_code)
 
         self._yandex_link = QLabel("", self)
@@ -86,7 +90,9 @@ class AuthDialog(QDialog):
         self._status.setWordWrap(True)
         layout.addWidget(self._status)
 
-        self.login_succeeded.connect(lambda *_: self._refresh())
+        # Сигналы испускаются из фонового потока — Qt доставит их в GUI-поток.
+        self.login_succeeded.connect(self._on_login_succeeded)
+        self.login_failed.connect(self._on_login_failed)
         self._refresh()
 
     # ------------------------------------------------------------------
@@ -118,7 +124,6 @@ class AuthDialog(QDialog):
             return
         self._yandex_code.setVisible(True)
         self._yandex_code.setFocus()
-        self._yandex_code.returnPressed.connect(self._finish_yandex)
 
         # Открываем страницу авторизации: Яндекс покажет код подтверждения.
         url = self._oauth.auth_url(ProviderId.YANDEX)
@@ -134,19 +139,24 @@ class AuthDialog(QDialog):
             )
         else:
             self._status.setText(
-                "Войдите в Яндекс в браузере и скопируйте код (7 цифр) — "
+                "Войдите в Яндекс в браузере и скопируйте код подтверждения — "
                 "он подставится сам."
             )
 
     @staticmethod
     def _clipboard_code() -> str:
-        """Код подтверждения Яндекса — 7 цифр."""
+        """Код подтверждения Яндекса из буфера обмена (цифры или буквы с цифрами)."""
         clipboard = QApplication.clipboard()
         if clipboard is None:
             return ""
-        text = (clipboard.text() or "").strip()
-        if text.isdigit() and 6 <= len(text) <= 10:
-            return text
+        text = clipboard.text() or ""
+        if len(text) > 300:
+            return ""
+        code = normalize_code(text)
+        # Буквенный код без единой цифры почти наверняка просто слово из буфера.
+        if 6 <= len(code) <= 32 and code.isalnum() and code.isascii() \
+                and any(ch.isdigit() for ch in code):
+            return code
         return ""
 
     def _finish_yandex(self) -> None:
@@ -166,6 +176,19 @@ class AuthDialog(QDialog):
         self._google_btn.setEnabled(False)
         future = self._runtime.submit(self._oauth.login_with_browser(ProviderId.GOOGLE))
         future.add_done_callback(lambda fut: self._on_done(ProviderId.GOOGLE, fut))
+
+    def _on_login_succeeded(self, _pid: str, name: str) -> None:
+        self._yandex_btn.setEnabled(True)
+        self._google_btn.setEnabled(True)
+        self._yandex_code.clear()
+        self._status.setText(f"Вход выполнен: {name}")
+        self._refresh()
+
+    def _on_login_failed(self, _pid: str, message: str) -> None:
+        # Без этого диалог навсегда оставался в «Проверяем код…» с выключенной кнопкой.
+        self._yandex_btn.setEnabled(True)
+        self._google_btn.setEnabled(True)
+        self._status.setText(message)
 
     def _on_done(self, pid: ProviderId, future) -> None:
         try:

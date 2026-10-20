@@ -29,6 +29,9 @@ class FakeProvider:
 
         return DownloadLink(url=self.url, headers={}, size=file.size)
 
+    def forget_link(self, file: CloudFile) -> None:
+        pass
+
 
 class FakeRegistry:
     def __init__(self, provider: FakeProvider) -> None:
@@ -177,6 +180,43 @@ class TestTransfer(unittest.IsolatedAsyncioTestCase):
         transfer2 = Transfer(make_context(config, self.http, self.registry))
         with self.assertRaises(Exception):
             await transfer2.run(job2)
+        # Битый файл и его состояние удалены — повтор начнёт с нуля,
+        # а не «докачает» пустой остаток и снова упадёт на той же сумме.
+        self.assertFalse(job2.part_path.exists())
+        self.assertFalse(job2.state_path.exists())
+
+    async def test_different_file_with_same_name_is_kept(self) -> None:
+        """Чужой файл с тем же именем не удаляется — качаем рядом под другим именем."""
+        config = make_config(self.tmp)
+        (self.tmp / "test.mp4").write_bytes(b"other file")
+        job = make_job(self.tmp)
+        transfer = Transfer(make_context(config, self.http, self.registry))
+        await transfer.run(job)
+        self.assertEqual((self.tmp / "test.mp4").read_bytes(), b"other file")
+        self.assertEqual((self.tmp / "test (1).mp4").read_bytes(), PAYLOAD)
+        self.assertEqual(job.file.name, "test (1).mp4")
+
+    async def test_unknown_size_cut_is_not_accepted(self) -> None:
+        """Файл без известного размера, оборванный сервером, не считается скачанным."""
+        config = make_config(self.tmp, max_retries=1)
+        job = make_job(self.tmp)
+        job.file.size = 0
+        RangeHandler.fail_after = 100 * 1024
+        try:
+            transfer = Transfer(make_context(config, self.http, self.registry))
+            with self.assertRaises(Exception):
+                await transfer.run(job)
+        finally:
+            RangeHandler.fail_after = None
+        self.assertFalse((self.tmp / "test.mp4").exists())
+
+    async def test_unknown_size_downloads_whole_stream(self) -> None:
+        config = make_config(self.tmp)
+        job = make_job(self.tmp)
+        job.file.size = 0
+        transfer = Transfer(make_context(config, self.http, self.registry))
+        await transfer.run(job)
+        self.assertEqual((self.tmp / "test.mp4").read_bytes(), PAYLOAD)
 
 
 if __name__ == "__main__":

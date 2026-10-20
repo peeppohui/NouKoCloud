@@ -49,52 +49,45 @@ git ls-files | Select-String "config.json|tokens.dat|dist/|bin/"
 
 ## 4. Как выпустить релиз
 
-### Одна команда
+### Шаг 1. Собрать
 
 ```powershell
-packaging\release.ps1 -Version 0.2.0
-```
-
-Скрипт сам:
-
-1. соберёт `dist\svsCloud` (зависимости, ffmpeg, PyInstaller);
-2. упакует его в `release\svsCloud-win64.zip` — **имя архива постоянное**,
-   чтобы ссылка `releases/latest/download/svsCloud-win64.zip` никогда
-   не ломалась между версиями;
-3. создаст (или обновит) релиз с тегом `v<версия>` и зальёт архив через
-   API GitHub. Токен берётся из хранилища git (Git Credential Manager) —
-   при первом запуске откроется окно входа.
-
-Если в сборку нужны ключи OAuth (чтобы монтажёрам не пришлось их вводить):
-
-```powershell
-packaging\release.ps1 -Version 0.2.0 `
+git clone https://github.com/<ваш-аккаунт>/svsCloud.git
+cd svsCloud
+packaging\build.ps1 `
     -YandexClientId "1234567890" -YandexClientSecret "секрет" `
-    -GoogleClientId "xxxx.apps.googleusercontent.com" -GoogleClientSecret "GOCSPX-..."
+    -GoogleClientId "xxxx.apps.googleusercontent.com" -GoogleClientSecret "GOCSPX-..." `
+    -GoogleApiKey "AIza..."
 ```
 
-Опции: `-SkipBuild` (не пересобирать, только перезалить архив),
-`-SkipFfmpeg` (ffmpeg уже скачан).
+Скрипт сам поставит зависимости, скачает ffmpeg, соберёт `dist\svsCloud\`
+и положит рядом с exe `config.json` с ключами — **пользователю не нужно
+ничего вводить, достаточно нажать «Аккаунты» → «Войти»**.
+
+> Ключи OAuth лежат в репозитории только если вы добавите `config.json`
+> вручную — не добавляйте. В релиз они попадают через сборку.
 
 ### Шаг 2. Залить исходники
 
 ```powershell
 git add .
-git commit -m "svsCloud 0.2.0"
-git tag v0.2.0
+git commit -m "svsCloud 0.1.0"
+git tag v0.1.0
 git push origin main --tags
 ```
 
-> Тег `v0.2.0` должен указывать на тот же коммит, что и `main` — релиз
-> создаётся скриптом через API и берёт содержимое ветки по умолчанию.
+### Шаг 3. Прикрепить сборку к Releases
 
-### Шаг 3. Прикрепить сборку к Releases (вручную)
+На странице репозитория: **Releases → Draft a new release → v0.1.0**.
 
-Обычно не нужно — всё делает `release.ps1`. Если всё же руками:
-**Releases → Draft a new release → v0.2.0**, приложить
-`release\svsCloud-win64.zip` (GitHub не примет папку, только файл).
+Приложить:
+* `dist\svsCloud` — запакованным в zip (например `svsCloud-0.1.0-win64.zip`);
+  GitHub не примет папку, только файл;
+* `docs\ARCHITECTURE.md` и `docs\OAUTH_SETUP.md` — если хотите, чтобы они были
+  видны прямо на странице релиза (обычно достаточно ссылки на репозиторий).
 
-Лимит GitHub на один файл — 2 ГБ, наш архив — 136 МБ, запас большой.
+Проверьте, что zip меньше ~400 МБ — лимит GitHub на один файл 2 ГБ, но
+большие файлы лучше отдавать отдельной ссылкой (S3/Яндекс.Диск).
 
 ## 5. Сборка одним файлом (по желанию)
 
@@ -113,5 +106,5 @@ packaging\build.ps1 -OneFile
 * [ ] Проверить, что приложение Яндекса — типа «Для доступа к API»
 * [ ] Добавить иконку `packaging/app.ico` (сейчас иконки нет — будет дефолтная)
 * [ ] Решить, показывать ли свои ключи OAuth в сборке (удобно монтажёрам)
-* [ ] Прогнать `python -m unittest discover -s tests -t .` — должно быть 74 OK
+* [ ] Прогнать `python -m unittest discover -s tests -t .` — должно быть 71 OK
 * [ ] Проверить на машине без Python: распаковать zip и запустить exe

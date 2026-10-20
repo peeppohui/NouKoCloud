@@ -54,6 +54,8 @@ class MetadataCache:
         with self._lock:
             self._conn.executescript(SCHEMA)
             self._conn.execute("PRAGMA journal_mode=WAL")
+            # Старые версии сохраняли сюда заголовок Authorization открытым текстом.
+            self._conn.execute("DELETE FROM links WHERE headers LIKE '%uthorization%'")
             self._conn.commit()
 
     # ------------------------------------------------------------------
@@ -124,6 +126,11 @@ class MetadataCache:
         except json.JSONDecodeError:
             headers = {}
         return {"url": row["url"], "headers": headers, "size": row["size"], "expires_at": expires_at}
+
+    def drop_link(self, key: str) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM links WHERE key = ?", (key,))
+            self._conn.commit()
 
     def close(self) -> None:
         with self._lock:

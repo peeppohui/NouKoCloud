@@ -91,6 +91,17 @@ _STATUS_TEXT = {
 
 # Тексты, которые облака возвращают в теле ответа.
 _BODY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    # Google: при входе не отмечена галочка «Google Диск» (вход есть, прав на файлы нет).
+    # Должно стоять раньше общего insufficientPermissions — иначе пользователю
+    # советовали бы «попросить владельца», хотя дело в его собственном входе.
+    (re.compile(r"ACCESS_TOKEN_SCOPE_INSUFFICIENT|insufficient authentication scopes", re.I),
+     "У программы нет доступа к Google Диску: при входе не отмечена галочка "
+     "«Просмотр и скачивание всех файлов на Google Диске». Войдите заново "
+     "(«Аккаунты» → «Войти через Google Диск») и отметьте её."),
+    # Google: в проекте Google Cloud не включён Drive API.
+    (re.compile(r"SERVICE_DISABLED|accessNotConfigured|has not been used in project", re.I),
+     "В проекте Google Cloud не включён Google Drive API. Откройте console.cloud.google.com → "
+     "APIs & Services → Library → Google Drive API → Enable и подождите пару минут."),
     (re.compile(r"оборвал передачу|оборвал соединение", re.I),
      "Облако оборвало передачу файла. Попробуйте ещё раз — или скачайте его через браузер."),
     (re.compile(r"DiskNotFoundError|NotFoundError|Ресурс не найден", re.I),
@@ -164,6 +175,8 @@ def friendly_error(exc: BaseException, *, provider: str | None = None, response:
         resp = exc.response
         status = resp.status_code
         body = _extract_body_message(resp)
+        # Текст ответа облака — в журнал: без него причину 403 не понять.
+        log.info("Ответ облака %d: %s", status, body)
         for pattern, text in _BODY_PATTERNS:
             if pattern.search(body):
                 return text

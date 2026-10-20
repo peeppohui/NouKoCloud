@@ -100,6 +100,26 @@ class TestMainWindow(unittest.TestCase):
         jobs = self.ctx.engine.snapshot()
         self.assertEqual(len(jobs), 141, "в очередь должно встать 141 файл")
 
+    def test_my_drive_without_login_shows_hint(self) -> None:
+        """Автозагрузка «Моего диска» без входа: без окна, с подсказкой в дереве."""
+        self.win.ctx.oauth.is_logged_in = lambda pid: False
+        self.win._open_my_drive_for(ProviderId.GOOGLE, interactive=False)
+        drive = self.win.tree.drive(ProviderId.GOOGLE)
+        self.assertIn("войдите", drive.child(0).text())
+
+    def test_link_opened_next_to_my_drive(self) -> None:
+        """После открытия ссылки «Мой диск» остаётся в разделе."""
+        class Done:
+            def result(self_inner):
+                ctx = BrowseContext(source=SourceKind.PUBLIC, public_key="https://disk.yandex.ru/d/X",
+                                    display_name="Исходники")
+                return self.ctx.registry.get(ProviderId.YANDEX), ctx, [make_file("a.mp4")]
+
+        self.win._after_open(Done())
+        group = self.win.tree.group(ProviderId.YANDEX)
+        self.assertEqual([group.child(r).text() for r in range(group.rowCount())],
+                         ["Мой диск", "Исходники"])
+
 
 if __name__ == "__main__":
     unittest.main()

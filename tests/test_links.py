@@ -19,6 +19,13 @@ class TestLinkRouter(unittest.TestCase):
         self.assertEqual(parsed.public_key, "https://disk.yandex.ru/d/AbCdEf12")
         self.assertEqual(parsed.path, "/")
 
+    def test_yandex_file_link_keeps_i(self) -> None:
+        """/i/ — ссылка на отдельный файл. Превращать её в /d/ нельзя: Яндекс ответит 404."""
+        parsed = parse_link("https://disk.yandex.ru/i/8NDhH7I41pQqoQ")
+        self.assertEqual(parsed.public_key, "https://disk.yandex.ru/i/8NDhH7I41pQqoQ")
+        self.assertEqual(parse_link("https://yadi.sk/i/AbC-12_x").public_key,
+                         "https://disk.yandex.ru/i/AbC-12_x")
+
     def test_yandex_short_link(self) -> None:
         parsed = parse_link("https://yadi.sk/d/XyZ987")
         self.assertEqual(parsed.provider, ProviderId.YANDEX)
