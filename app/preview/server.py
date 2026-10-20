@@ -103,6 +103,8 @@ class _RangeSource:
                 "GET", self._direct_url or self._link.url,
                 # Отдельный ограничитель: превью не должно тормозить загрузки и API.
                 provider=f"{file.provider.value}-preview", headers=headers,
+                # Повторы здесь лишние: ниже свои попытки с перевыпуском ссылки.
+                retries=1,
             )
             status = response.status_code
             if via_direct and (status in _STALE_LINK or status >= 500):
@@ -425,7 +427,9 @@ class PreviewServer:
             # HEAD облака часто не поддерживают — всегда спрашиваем GET,
             # а для HEAD просто не передаём тело.
             response = await self._http.stream(
-                "GET", link.url, provider=file.provider.value, headers=upstream_headers
+                "GET", link.url, provider=file.provider.value, headers=upstream_headers,
+                # Повторы здесь лишние: выше уже есть свои попытки с перевыпуском.
+                retries=1,
             )
             if response.status_code not in _STALE_LINK or attempt:
                 return response

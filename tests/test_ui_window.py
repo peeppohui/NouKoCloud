@@ -120,6 +120,18 @@ class TestMainWindow(unittest.TestCase):
         self.assertEqual([group.child(r).text() for r in range(group.rowCount())],
                          ["Мой диск", "Исходники"])
 
+    def test_window_size_is_restored(self) -> None:
+        """Окно должно открываться того же размера, каким его закрыли."""
+        # Размер берём небольшим: в headless-режиме экран всего 800×800,
+        # и окно шире него всё равно зажмёт система.
+        self.win.resize(700, 600)
+        saved = self.win.saveGeometry().toBase64().data().decode()
+        self.win.resize(500, 400)
+        self.ctx.config.window_geometry = saved
+        self.win._restore_geometry()
+        self.assertEqual(self.win.size().width(), 700)
+        self.assertEqual(self.win.size().height(), 600)
+
 
 if __name__ == "__main__":
     unittest.main()

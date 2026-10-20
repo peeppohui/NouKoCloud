@@ -8,6 +8,7 @@ from typing import Protocol
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDialog,
     QDoubleSpinBox,
     QDialogButtonBox,
@@ -133,6 +134,14 @@ class SettingsDialog(QDialog):
         self._speed.setSpecialValueText("Без ограничения")
         self._speed.setSuffix(" Мбит/с")
         downloads_form.addRow("Ограничение скорости", self._speed)
+
+        self._keep_parts = QCheckBox("Хранить недокачанные файлы", downloads_box)
+        self._keep_parts.setChecked(config.keep_partial_files)
+        self._keep_parts.setToolTip(
+            "Отменённая загрузка останется на диске — её можно продолжить "
+            "при следующем запуске программы."
+        )
+        downloads_form.addRow(self._keep_parts)
         layout.addWidget(downloads_box)
 
         # --- Превью ---
@@ -197,6 +206,21 @@ class SettingsDialog(QDialog):
         usage_row.addWidget(self._cache_clear)
         preview_form.addRow("Занято", usage_row)
         layout.addWidget(preview_box)
+
+        # --- Журнал ---
+        logs_box = QGroupBox("Журнал", self)
+        logs_form = QFormLayout(logs_box)
+        self._log_level = QComboBox(logs_box)
+        self._log_level.addItems(["DEBUG", "INFO", "WARNING", "ERROR"])
+        current = (config.log_level or "INFO").upper()
+        index = self._log_level.findText(current)
+        self._log_level.setCurrentIndex(max(0, index))
+        self._log_level.setToolTip(
+            "Подробность журнала. В файле по умолчанию INFO: видно всё важное "
+            "и без служебного шума."
+        )
+        logs_form.addRow("Уровень журнала", self._log_level)
+        layout.addWidget(logs_box)
         self._dir.textChanged.connect(self._update_cache_info)
         self._update_cache_info()
 
@@ -292,7 +316,9 @@ class SettingsDialog(QDialog):
         config.segment_min_mb = self._segment_mb.value()
         config.use_segments = self._use_segments.isChecked()
         config.download_speed_limit_mbps = self._speed.value()
+        config.keep_partial_files = self._keep_parts.isChecked()
         config.ffmpeg_path = self._ffmpeg.text().strip()
+        config.log_level = self._log_level.currentText()
 
         old_cache = self._current_cache_path()
         config.preview_cache_dir = self._cache_dir.text().strip()

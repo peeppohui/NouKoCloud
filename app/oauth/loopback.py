@@ -24,6 +24,16 @@ _PAGE = """<!doctype html><html lang="ru"><head><meta charset="utf-8">
 </body></html>"""
 
 
+def _query_of(request_line: bytes) -> str:
+    """Путь из строки запроса: «GET /?code=1 HTTP/1.1» → «/?code=1»."""
+    if not request_line:
+        return ""
+    parts = request_line.decode("latin-1", "ignore").split(" ")
+    if len(parts) < 2:
+        return ""
+    return parts[1]
+
+
 class LoopbackRedirectServer:
     """Одноразовый сервер: поймал код — остановился."""
 
@@ -69,6 +79,13 @@ class LoopbackRedirectServer:
             self._future.cancel()
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        code = await self._respond(reader, writer)
+        if code and self._future is not None and not self._future.done():
+            self._future.set_result(code)
+
+    async def _respond(self, reader: asyncio.StreamReader,
+                       writer: asyncio.StreamWriter) -> str | None:
+        """Показывает страницу браузеру и возвращает код авторизации (если есть)."""
         try:
             request_line = await asyncio.wait_for(reader.readline(), timeout=10)
             # Остальные заголовки дочитываем, чтобы клиент не получил RST.
@@ -76,7 +93,7 @@ class LoopbackRedirectServer:
                 line = await asyncio.wait_for(reader.readline(), timeout=10)
                 if line in (b"\r\n", b"\n", b""):
                     break
-            query = request_line.decode("latin-1", "ignore").split(" ")[1] if request_line else ""
+            query = _query_of(request_line)
             params = parse_qs(urlparse(query).query)
             code = (params.get("code") or [None])[0]
             error = (params.get("error") or [None])[0]
@@ -84,7 +101,7 @@ class LoopbackRedirectServer:
             if error:
                 title, text = "Не удалось войти", f"Облако ответило ошибкой: {error}"
             elif code:
-                title, text = "Готово", "Вход выполнен. Можно возвращаться в приложение."
+                title, text = "Готово", "Вход выполнен. Можно возвращаться в приложению."
             else:
                 title, text = "Пустая страница", "Ожидался код авторизации."
 
@@ -96,13 +113,14 @@ class LoopbackRedirectServer:
                 + body
             )
             await writer.drain()
+            return code
         except Exception as exc:  # pragma: no cover
+            # Мусорный запрос или обрыв — это не повод ронять обработчик.
             log.debug("Ошибка loopback-сервера: %s", exc)
+            return None
         finally:
             try:
                 writer.close()
                 await writer.wait_closed()
             except Exception:
                 pass
-        if code and self._future is not None and not self._future.done():
-            self._future.set_result(code)

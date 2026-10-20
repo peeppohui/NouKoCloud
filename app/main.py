@@ -10,7 +10,7 @@ from PySide6.QtWidgets import QApplication
 
 from .context import build_context
 from .core.config import AppConfig
-from .core.logging_setup import setup_logging
+from .core.logging_setup import level_from_name, setup_logging
 from .core.paths import APP_TITLE
 from .ui.main_window import MainWindow
 
@@ -19,11 +19,12 @@ log = logging.getLogger(__name__)
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(argv if argv is not None else sys.argv)
-    log_file = setup_logging()
+    # Настройки читаем до журнала: уровень подробности логов задаётся в них.
+    config = AppConfig.load()
+    log_file = setup_logging(level=level_from_name(config.log_level))
     log.info("Запуск %s", APP_TITLE)
     log.info("Журнал: %s", log_file)
 
-    config = AppConfig.load()
     log.info(
         "Ключи OAuth: Яндекс — %s, Google — %s",
         "заданы" if config.yandex_client_id else "не заданы",

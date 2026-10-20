@@ -64,6 +64,7 @@ class HttpClient:
     ) -> httpx.Response:
         """Запрос с учётом лимитов и повторов. 401 превращается в TokenExpiredError."""
         attempts = retries if retries is not None else self._config.max_retries
+        attempts = max(1, attempts)          # ноль повторов — это одна попытка
         policy = RetryPolicy(max_attempts=attempts, base_delay=self._config.retry_base_delay,
                              max_delay=self._config.retry_max_delay)
         last_exc: Exception | None = None
@@ -87,13 +88,20 @@ class HttpClient:
             if response.status_code == 401:
                 raise TokenExpiredError(technical=f"401 от {provider}: {url}")
 
-            if response.status_code in (429, 503):
+            # Повторяем всё, что в политике: 408, 425, 429, 500, 502, 503, 504.
+            # Раньше повторялись только 429 и 503 — 502 от Яндекса ронял
+            # задание с первой попытки.
+            if response.status_code in policy.retry_statuses:
                 retry_after = parse_retry_after(response)
                 delay = compute_delay(attempt, retry_after, policy)
                 self._limiter.cooldown(provider, delay)
                 if attempt >= policy.max_attempts:
                     if raise_for_status:
-                        response.raise_for_status()
+                        try:
+                            response.raise_for_status()
+                        finally:
+                            # Соединение не должно остаться висеть.
+                            await response.aclose()
                     return response
                 log.warning("%s: ответ %d, ждём %.1f с", provider, response.status_code, delay)
                 await response.aclose()
@@ -118,11 +126,35 @@ class HttpClient:
         headers: Mapping[str, str] | None = None,
         params: Mapping[str, Any] | None = None,
         timeout: httpx.Timeout | float | None = None,
+        retries: int | None = None,
     ) -> httpx.Response:
-        """Открывает поток без повторов — докачкой занимается загрузчик."""
-        await self._limiter.acquire(provider)
-        request = self._client.build_request(method, url, headers=headers, params=params, timeout=timeout)
-        return await self._client.send(request, stream=True)
+        """Открывает поток с повторами при 429/5xx.
+
+        Раньше повторов здесь не было вовсе: 429 с «Retry-After» от облака
+        доходил до загрузчика как обычная ошибка, и следующий сегмент бил
+        по тому же хосту без паузы.
+        """
+        attempts = retries if retries is not None else self._config.max_retries
+        attempts = max(1, attempts)
+        policy = RetryPolicy(max_attempts=attempts, base_delay=self._config.retry_base_delay,
+                             max_delay=self._config.retry_max_delay)
+        for attempt in range(1, policy.max_attempts + 1):
+            await self._limiter.acquire(provider)
+            request = self._client.build_request(
+                method, url, headers=headers, params=params, timeout=timeout
+            )
+            response = await self._client.send(request, stream=True)
+            if response.status_code not in policy.retry_statuses:
+                return response
+            if attempt >= policy.max_attempts:
+                return response
+            retry_after = parse_retry_after(response)
+            delay = compute_delay(attempt, retry_after, policy)
+            self._limiter.cooldown(provider, delay)
+            log.warning("%s: поток %d, ждём %.1f с", provider, response.status_code, delay)
+            await response.aclose()
+            await _sleep(delay)
+        raise RuntimeError("Неизвестный сбой HTTP-клиента")
 
 
 async def _sleep(delay: float) -> None:

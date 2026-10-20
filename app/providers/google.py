@@ -34,6 +34,7 @@ FIELDS = (
 FOLDER_MIME = "application/vnd.google-apps.folder"
 SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
 GOOGLE_APP_MIME_PREFIX = "application/vnd.google-apps."
+MAX_PAGES = 50          # предохранитель от бесконечного листинга
 
 EXPORT_MIME = {
     "application/vnd.google-apps.document": ("application/pdf", ".pdf"),
@@ -95,7 +96,7 @@ class GoogleProvider(CloudProvider):
         # структуру папок, и одноимённые файлы из разных папок не сталкиваются.
         parent_path = (parent.path if parent is not None else "").strip("/")
 
-        while True:
+        for _page_no in range(MAX_PAGES):
             if page_token:
                 params["pageToken"] = page_token
             response = await self.http.request(
@@ -109,6 +110,10 @@ class GoogleProvider(CloudProvider):
             page_token = payload.get("nextPageToken")
             if not page_token:
                 break
+        else:
+            # nextPageToken не кончился — предохранитель от бесконечного
+            # листинга (у Яндекса он есть, у Google — нет).
+            log.warning("Google: список не закончился за %d страниц", MAX_PAGES)
 
         return collected
 
