@@ -49,14 +49,44 @@ class MetadataCache:
     def __init__(self, path: Path | None = None) -> None:
         self._path = path or (app_data_dir() / "cache.db")
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(str(self._path), check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        with self._lock:
-            self._conn.executescript(SCHEMA)
-            self._conn.execute("PRAGMA journal_mode=WAL")
+        try:
+            self._conn = self._open()
+        except sqlite3.DatabaseError as exc:
+            # Файл испорчен (обрыв питания, процесс убит во время записи).
+            # Это только кэш — откладываем его в сторону и начинаем с чистого,
+            # иначе программа не запустится вовсе.
+            log.warning("Кэш %s повреждён (%s) — создаём заново", self._path, exc)
+            self._set_aside()
+            self._conn = self._open()
+
+    def _open(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self._path), check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute("PRAGMA quick_check").fetchone()
+            if row is None or row[0] != "ok":
+                raise sqlite3.DatabaseError(f"quick_check: {row[0] if row else '?'}")
+            conn.executescript(SCHEMA)
+            conn.execute("PRAGMA journal_mode=WAL")
             # Старые версии сохраняли сюда заголовок Authorization открытым текстом.
-            self._conn.execute("DELETE FROM links WHERE headers LIKE '%uthorization%'")
-            self._conn.commit()
+            conn.execute("DELETE FROM links WHERE headers LIKE '%uthorization%'")
+            conn.commit()
+        except sqlite3.DatabaseError:
+            conn.close()
+            raise
+        return conn
+
+    def _set_aside(self) -> None:
+        """Переименовывает испорченный кэш в cache.db.broken (старый такой — заменяется)."""
+        for suffix in ("", "-wal", "-shm"):
+            src = Path(f"{self._path}{suffix}")
+            if not src.exists():
+                continue
+            dst = Path(f"{self._path}.broken{suffix}")
+            try:
+                src.replace(dst)
+            except OSError:
+                src.unlink(missing_ok=True)
 
     # ------------------------------------------------------------------
     @staticmethod

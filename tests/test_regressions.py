@@ -355,5 +355,37 @@ class TestCancel(unittest.IsolatedAsyncioTestCase):
             await engine2.stop()
 
 
+class TestBrokenCache(unittest.TestCase):
+    """Испорченный cache.db не должен мешать запуску программы."""
+
+    def test_malformed_cache_is_recreated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cache.db"
+            cache = MetadataCache(path)
+            cache.put_link("k", "https://x", {}, 1, None)
+            cache.close()
+            data = bytearray(path.read_bytes())
+            data[100:4096] = b"\xff" * (4096 - 100)     # портим заголовок и схему
+            path.write_bytes(bytes(data))
+
+            cache = MetadataCache(path)
+            try:
+                self.assertIsNone(cache.get_link("k"), "кэш начат с чистого")
+                cache.put_link("k2", "https://y", {}, 1, None)
+                self.assertEqual(cache.get_link("k2")["url"], "https://y")
+            finally:
+                cache.close()
+            self.assertTrue((Path(tmp) / "cache.db.broken").exists(), "испорченный файл отложен")
+
+    def test_garbage_file_is_recreated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cache.db"
+            path.write_bytes(b"not a database at all" * 100)
+            cache = MetadataCache(path)
+            cache.put_link("k", "https://x", {}, 1, None)
+            self.assertEqual(cache.get_link("k")["url"], "https://x")
+            cache.close()
+
+
 if __name__ == "__main__":
     unittest.main()
