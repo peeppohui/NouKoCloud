@@ -11,6 +11,8 @@ import unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from datetime import datetime, timezone  # noqa: E402
+
 from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
@@ -26,7 +28,8 @@ def setUpModule() -> None:
     _app = QApplication.instance() or QApplication([])
 
 
-def make_file(name: str, kind=EntryKind.FILE, size: int = 1024) -> CloudFile:
+def make_file(name: str, kind=EntryKind.FILE, size: int = 1024,
+              modified: datetime | None = None) -> CloudFile:
     return CloudFile(
         provider=ProviderId.YANDEX,
         file_id=name,
@@ -35,7 +38,12 @@ def make_file(name: str, kind=EntryKind.FILE, size: int = 1024) -> CloudFile:
         kind=kind,
         size=size,
         source=SourceKind.PUBLIC,
+        modified=modified,
     )
+
+
+def child_names(item) -> list[str]:
+    return [item.child(r).text() for r in range(item.rowCount())]
 
 
 class TestFileTree(unittest.TestCase):
@@ -295,6 +303,127 @@ class TestFileTree(unittest.TestCase):
 
         self.tree._on_expanded(self.tree._model.indexFromItem(folder))
         self.assertEqual(calls, ["папка", "папка"], "повторное раскрытие запрашивает снова")
+
+
+class TestSorting(unittest.TestCase):
+    """Сортировка по клику на заголовок колонки."""
+
+    def setUp(self) -> None:
+        self.tree = FileTree()
+        self.ctx = BrowseContext(source=SourceKind.PUBLIC, public_key="https://disk.yandex.ru/d/X")
+        self.root = self.tree.add_root("Ссылка · X", self.ctx, provider=ProviderId.YANDEX)
+        self.tree.set_children(self.root, [
+            make_file("b.mp4", size=100),
+            make_file("A.mp4", size=9_000_000),
+            make_file("c.mp4", size=100),
+            make_file("папка", EntryKind.FOLDER),
+            make_file("a.mp4", size=2_000_000),
+        ])
+
+    def click(self, column: int) -> None:
+        self.tree._on_section_clicked(column)
+
+    def test_sort_by_size_is_numeric_not_textual(self) -> None:
+        """«9 МБ» больше «2 МБ» — строковое сравнение дало бы обратный порядок."""
+        self.click(1)
+        self.assertEqual(child_names(self.root), ["папка", "b.mp4", "c.mp4", "a.mp4", "A.mp4"])
+
+    def test_folders_stay_on_top_in_both_directions(self) -> None:
+        self.click(1)
+        self.assertEqual(child_names(self.root)[0], "папка")
+        self.click(1)                                   # тот же столбец — наоборот
+        self.assertEqual(child_names(self.root)[0], "папка")
+        self.assertEqual(child_names(self.root), ["папка", "A.mp4", "a.mp4", "b.mp4", "c.mp4"])
+
+    def test_repeated_click_reverses_order(self) -> None:
+        self.click(1)
+        first = child_names(self.root)
+        self.click(1)
+        self.assertNotEqual(first, child_names(self.root))
+        self.assertEqual(sorted(first), sorted(child_names(self.root)))
+
+    def test_sort_by_name_ignores_case(self) -> None:
+        """Имя сравнивается без учёта регистра: A.mp4 рядом с a.mp4."""
+        # По умолчанию дерево уже отсортировано по имени — клик по активному
+        # столбцу разворачивает порядок, как в проводнике Windows.
+        self.click(0)
+        self.assertEqual(child_names(self.root), ["папка", "c.mp4", "b.mp4", "A.mp4", "a.mp4"])
+        self.click(0)
+        self.assertEqual(child_names(self.root), ["папка", "A.mp4", "a.mp4", "b.mp4", "c.mp4"])
+
+    def test_sort_by_date(self) -> None:
+        self.tree.set_children(self.root, [
+            make_file("старый.mp4", modified=datetime(2024, 1, 1, tzinfo=timezone.utc)),
+            make_file("новый.mp4", modified=datetime(2026, 1, 1, tzinfo=timezone.utc)),
+        ])
+        self.click(2)
+        self.assertEqual(child_names(self.root), ["старый.mp4", "новый.mp4"])
+        self.click(2)
+        self.assertEqual(child_names(self.root), ["новый.mp4", "старый.mp4"])
+
+    def test_new_files_appear_in_sorted_order(self) -> None:
+        """Папка догрузилась позже — её файлы тоже должны встать по сортировке."""
+        self.click(1)
+        self.tree.set_children(self.root, [
+            make_file("b.mp4", size=100),
+            make_file("A.mp4", size=9_000_000),
+            make_file("a.mp4", size=2_000_000),
+        ])
+        self.assertEqual(child_names(self.root), ["b.mp4", "a.mp4", "A.mp4"])
+
+    def test_sections_keep_their_order(self) -> None:
+        """Разделы облаков и «Мой диск» на своих местах, ссылки сортируются."""
+        self.tree.add_root("Ссылка · ZZZ", self.ctx, provider=ProviderId.YANDEX)
+        self.click(1)
+        model = self.tree._model
+        self.assertEqual([model.item(r).text() for r in range(model.rowCount())],
+                         ["Яндекс.Диск", "Google Диск"])
+        yandex = self.tree.group(ProviderId.YANDEX)
+        self.assertEqual(child_names(yandex)[0], "Мой диск")
+        self.assertTrue(yandex.child(0).data(DRIVE_ROLE))
+
+    def test_checkboxes_survive_sorting(self) -> None:
+        b = [self.root.child(r) for r in range(self.root.rowCount()) if self.root.child(r).text() == "b.mp4"][0]
+        b.setCheckState(Qt.CheckState.Checked)
+        self.click(1)
+        self.assertEqual([f.name for f in self.tree.checked_files()], ["b.mp4"])
+
+    def test_expanded_folders_stay_expanded(self) -> None:
+        folder = [self.root.child(r) for r in range(self.root.rowCount())
+                  if self.root.child(r).text() == "папка"][0]
+        self.tree.set_children(folder, [make_file("внутри.mp4")])
+        self.tree.expand_item(folder)
+        self.assertTrue(self.tree._view.isExpanded(self.tree._model.indexFromItem(folder)))
+        self.click(1)
+        self.assertTrue(self.tree._view.isExpanded(self.tree._model.indexFromItem(folder)))
+        self.assertEqual(child_names(folder), ["внутри.mp4"])
+
+    def test_subfolder_is_sorted_too(self) -> None:
+        folder = [self.root.child(r) for r in range(self.root.rowCount())
+                  if self.root.child(r).text() == "папка"][0]
+        self.tree.set_children(folder, [
+            make_file("big.mp4", size=900),
+            make_file("small.mp4", size=10),
+        ])
+        self.click(1)
+        self.assertEqual(child_names(folder), ["small.mp4", "big.mp4"])
+
+    def test_size_and_date_survive_sorting(self) -> None:
+        """Раньше перестановка строк съедала колонки «Размер» и «Изменён»."""
+        def row_texts(item):
+            out = []
+            for r in range(item.rowCount()):
+                cells = [item.child(r, c) for c in range(3)]
+                out.append(tuple(c.text() if c is not None else "" for c in cells))
+            return out
+
+        before = row_texts(self.root)
+        self.assertTrue(any(cells[1] for cells in before), "в колонке «Размер» что-то есть")
+        self.click(1)
+        after = row_texts(self.root)
+        self.assertEqual(sorted(before), sorted(after), "содержимое строк не изменилось")
+        self.assertEqual(sorted(c for c in after if c[1]), sorted(c for c in before if c[1]),
+                         "колонка «Размер» не должна опустеть")
 
 
 if __name__ == "__main__":

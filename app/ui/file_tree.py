@@ -79,6 +79,109 @@ def human_size(size: int) -> str:
     return f"{value:.1f} ТБ"
 
 
+class TreeModel(QStandardItemModel):
+    """Модель дерева файлов с сортировкой по настоящим значениям.
+
+    Стандартная QStandardItemModel сортирует по строке в колонке, поэтому
+    «10 МБ» встало бы раньше «9 МБ», а дата — в виде «31.12.2025 10:00».
+    Своя сортировка сравнивает размер в байтах и время изменения.
+
+    Папки всегда сверху — как в проводнике Windows; разделы облаков и
+    «Мой диск» на своих местах и не переставляются.
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.sort_column = 0
+        self.sort_order = Qt.SortOrder.AscendingOrder
+
+    # ------------------------------------------------------------------
+    # Сортировка списка файлов (до вставки в дерево)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _value(file: CloudFile, column: int):
+        if column == 1:
+            return file.size
+        if column == 2:
+            return file.modified_ts
+        return file.name.lower()
+
+    def sorted_files(self, files: list[CloudFile]) -> list[CloudFile]:
+        """Файлы в порядке текущей сортировки — так они встанут в дерево."""
+        column, order = self.sort_column, self.sort_order
+        result = sorted(files, key=lambda f: f.name.lower())
+        result.sort(key=lambda f: self._value(f, column),
+                    reverse=order == Qt.SortOrder.DescendingOrder)
+        result.sort(key=lambda f: 0 if not f.is_file else 1)
+        return result
+
+    # ------------------------------------------------------------------
+    # Сортировка уже показанных строк
+    # ------------------------------------------------------------------
+    def sort(self, column: int, order: Qt.SortOrder = Qt.SortOrder.AscendingOrder) -> None:
+        self.sort_column = column
+        self.sort_order = order
+        for row in range(self.rowCount()):
+            self._sort_subtree(self.item(row), column, order)
+
+    def _sort_subtree(self, item, column: int, order: Qt.SortOrder) -> None:
+        if item is None:
+            return
+        self._sort_children(item, column, order)
+        for row in range(item.rowCount()):
+            self._sort_subtree(item.child(row), column, order)
+
+    def _sort_children(self, parent, column: int, order: Qt.SortOrder) -> None:
+        count = parent.rowCount()
+        if count < 2:
+            return
+        children = [parent.child(r) for r in range(count)]
+        if parent.data(GROUP_ROLE) is not None:
+            ordered = self._order_links(children, order)
+        else:
+            ordered = self._order_files(children, column, order)
+        if ordered is None:
+            return
+        if [self._key(children[i], column) for i in ordered] == \
+                [self._key(c, column) for c in children]:
+            return
+        # takeRow отдаёт СПИСОК item'ов (вся строка целиком). Если взять
+        # только первый item, колонки «Размер» и «Изменён» исчезнут.
+        rows = [parent.takeRow(0) for _ in range(count)]
+        for index in ordered:
+            parent.appendRow(rows[index])
+
+    @staticmethod
+    def _order_links(children, order: Qt.SortOrder) -> list[int]:
+        """В разделе облака «Мой диск» закреплён первым, ссылки — по имени."""
+        fixed = [i for i, c in enumerate(children) if c.data(DRIVE_ROLE)]
+        links = [i for i, c in enumerate(children) if not c.data(DRIVE_ROLE)]
+        links.sort(key=lambda i: children[i].text().lower(),
+                   reverse=order == Qt.SortOrder.DescendingOrder)
+        return fixed + links
+
+    def _order_files(self, children, column: int, order: Qt.SortOrder) -> Optional[list[int]]:
+        """Строки-файлы: сначала по имени, потом по выбранной колонке, папки сверху."""
+        files = []
+        for child in children:
+            file = child.data(FILE_ROLE) if child is not None else None
+            if not isinstance(file, CloudFile):
+                return None       # служебная строка («загрузка…», подсказка)
+            files.append(file)
+        result = sorted(range(len(files)), key=lambda i: files[i].name.lower())
+        result.sort(key=lambda i: self._value(files[i], column),
+                    reverse=order == Qt.SortOrder.DescendingOrder)
+        result.sort(key=lambda i: 0 if not files[i].is_file else 1)
+        return result
+
+    def _key(self, child, column: int):
+        """Ключ строки — по нему видно, что порядок уже правильный."""
+        file = child.data(FILE_ROLE) if child is not None else None
+        if isinstance(file, CloudFile):
+            return (0 if not file.is_file else 1, self._value(file, column), file.name.lower())
+        return (2, 0, child.text().lower() if child is not None else "")
+
+
 class FileTree(QWidget):
     """Виджет дерева: слева — структура, справа — ничего."""
 
@@ -91,7 +194,7 @@ class FileTree(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._model = QStandardItemModel(self)
+        self._model = TreeModel(self)
         self._model.setHorizontalHeaderLabels(["Файл", "Размер", "Изменён"])
         self._counter = 0
         self._pending: dict[int, QStandardItem] = {}   # token -> родительская папка
@@ -130,6 +233,13 @@ class FileTree(QWidget):
         self._view.setColumnWidth(0, 330)
         self._view.setColumnWidth(1, 90)
         self._view.setColumnWidth(2, 130)
+        # Сортировку делаем сами (см. TreeModel): штатная QStandardItemModel
+        # сравнивает колонки как строки, и «10 МБ» встало бы раньше «9 МБ».
+        # Сортировку view выключена, но стрелку в заголовке показываем.
+        self._view.header().setSectionsClickable(True)
+        self._view.header().setSortIndicatorShown(True)
+        self._view.header().sectionClicked.connect(self._on_section_clicked)
+        self._view.header().setSortIndicator(0, Qt.SortOrder.AscendingOrder)
         self._view.expanded.connect(self._on_expanded)
         # activated — двойной клик и Enter (на Windows).
         self._view.activated.connect(self._on_double_clicked)
@@ -363,7 +473,8 @@ class FileTree(QWidget):
         count = self._model.rowCount(parent_index)
         if count:
             self._model.removeRows(0, count, parent_index)
-        for file in files:
+        # Файлы сразу встают в порядке текущей сортировки.
+        for file in self._model.sorted_files(files):
             parent_item.appendRow(self._make_row(file, parent_item.data(CTX_ROLE)))
         parent_item.setData(True, LOADED_ROLE)
         # Папку отметили до того, как пришло её содержимое: отмечаем и его,
@@ -403,6 +514,43 @@ class FileTree(QWidget):
         modified.setEditable(False)
         modified.setData(file, FILE_ROLE)
         return [name, size, modified]
+
+    # ------------------------------------------------------------------
+    # Сортировка по клику на заголовок
+    # ------------------------------------------------------------------
+    def _on_section_clicked(self, column: int) -> None:
+        """Клик по заголовку — сортируем по этой колонке, повторный — наоборот."""
+        order = Qt.SortOrder.AscendingOrder
+        if self._model.sort_column == column \
+                and self._model.sort_order == Qt.SortOrder.AscendingOrder:
+            order = Qt.SortOrder.DescendingOrder
+        # Перестановка строк сбрасывает раскрытость — запоминаем и возвращаем.
+        expanded = self._expanded_items()
+        self._model.sort(column, order)
+        self._view.header().setSortIndicator(column, order)
+        for item in expanded:
+            self._view.expand(self._model.indexFromItem(item))
+
+    def _expanded_items(self) -> list[QStandardItem]:
+        """Что сейчас раскрыто — чтобы после сортировки вернуть как было."""
+        result = []
+        for item in self._all_items():
+            if self._view.isExpanded(self._model.indexFromItem(item)):
+                result.append(item)
+        return result
+
+    def _all_items(self):
+        def walk(item):
+            yield item
+            for row in range(item.rowCount()):
+                child = item.child(row)
+                if child is not None:
+                    yield from walk(child)
+
+        for row in range(self._model.rowCount()):
+            item = self._model.item(row)
+            if item is not None:
+                yield from walk(item)
 
     # ------------------------------------------------------------------
     def _on_expanded(self, index) -> None:
