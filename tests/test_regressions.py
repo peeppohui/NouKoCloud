@@ -509,33 +509,35 @@ class TestProgressThrottle(unittest.TestCase):
     """
 
     def test_every_job_gets_its_own_progress(self) -> None:
-        config = AppConfig()
-        bus = mock.Mock()
-        engine = DownloadEngine(config, None, None, None, bus)  # type: ignore[arg-type]
-        jobs = []
-        for index in range(3):
-            file = CloudFile(provider=ProviderId.YANDEX, file_id=str(index), path=f"/{index}.mp4",
-                             name=f"{index}.mp4", kind=EntryKind.FILE, size=100,
-                             source=SourceKind.PUBLIC)
-            jobs.append(DownloadJob(file=file, dest_dir=Path(".")))
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig()
+            bus = mock.Mock()
+            engine = DownloadEngine(config, None, None, None, bus)  # type: ignore[arg-type]
+            jobs = []
+            for index in range(3):
+                file = CloudFile(provider=ProviderId.YANDEX, file_id=str(index), path=f"/{index}.mp4",
+                                 name=f"{index}.mp4", kind=EntryKind.FILE, size=100,
+                                 source=SourceKind.PUBLIC)
+                jobs.append(DownloadJob(file=file, dest_dir=Path(tmp)))
 
-        for job in jobs:
-            engine._on_progress(job)
+            for job in jobs:
+                engine._on_progress(job)
 
-        emitted = [call.args[0] for call in bus.job_progress.emit.call_args_list]
-        self.assertEqual(len(emitted), 3, "каждое задание должно получить свой прогресс")
-        self.assertEqual({job.job_id for job in emitted}, {job.job_id for job in jobs})
+            emitted = [call.args[0] for call in bus.job_progress.emit.call_args_list]
+            self.assertEqual(len(emitted), 3, "каждое задание должно получить свой прогресс")
+            self.assertEqual({job.job_id for job in emitted}, {job.job_id for job in jobs})
 
     def test_repeated_progress_of_one_job_is_throttled(self) -> None:
-        config = AppConfig()
-        bus = mock.Mock()
-        engine = DownloadEngine(config, None, None, None, bus)  # type: ignore[arg-type]
-        file = CloudFile(provider=ProviderId.YANDEX, file_id="1", path="/a.mp4", name="a.mp4",
-                         kind=EntryKind.FILE, size=100, source=SourceKind.PUBLIC)
-        job = DownloadJob(file=file, dest_dir=Path("."))
-        for _ in range(20):
-            engine._on_progress(job)
-        self.assertLessEqual(len(bus.job_progress.emit.call_args_list), 2)
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig()
+            bus = mock.Mock()
+            engine = DownloadEngine(config, None, None, None, bus)  # type: ignore[arg-type]
+            file = CloudFile(provider=ProviderId.YANDEX, file_id="1", path="/a.mp4", name="a.mp4",
+                             kind=EntryKind.FILE, size=100, source=SourceKind.PUBLIC)
+            job = DownloadJob(file=file, dest_dir=Path(tmp))
+            for _ in range(20):
+                engine._on_progress(job)
+            self.assertLessEqual(len(bus.job_progress.emit.call_args_list), 2)
 
 
 class TestBrokenCache(unittest.TestCase):

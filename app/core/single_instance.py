@@ -27,7 +27,12 @@ def channel_name() -> str:
 
 
 def send_to_running(message: str, timeout_ms: int = 400) -> bool:
-    """True — программа уже запущена и получила команду."""
+    """True — программа уже запущена и получила команду.
+
+    Проверяем ответ: сервер пишет «ok», только когда команда прочитана.
+    Без ответа считаем, что команда не дошла, — иначе повторный запуск
+    (ярлык, «Открыть с помощью») молча ничего бы не сделал.
+    """
     socket = QLocalSocket()
     socket.connectToServer(channel_name())
     if not socket.waitForConnected(timeout_ms):
@@ -38,8 +43,9 @@ def send_to_running(message: str, timeout_ms: int = 400) -> bool:
     # Ждём ответ «ok»: на Windows канал, закрытый сразу после записи,
     # может потерять ещё не прочитанную команду.
     socket.waitForReadyRead(max(timeout_ms, 2000))
+    answer = bytes(socket.readAll()).decode("utf-8", "replace").strip()
     socket.disconnectFromServer()
-    return True
+    return answer.startswith("ok")
 
 
 class InstanceServer(QObject):

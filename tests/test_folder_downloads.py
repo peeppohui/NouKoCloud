@@ -88,6 +88,10 @@ class TestWindowQueuesIntoFolders(unittest.TestCase):
         config.download_dir = tmp.name
         ctx = build_context(config)
         win = MainWindow(ctx)
+        # Гасим и фоновой цикл — иначе его задачи переживут тест.
+        # addCleanup выполняется в обратном порядке, поэтому цикл гасим
+        # первым в списке: тогда он остановится последним, после движка.
+        self.addCleanup(ctx.runtime.stop)
         self.addCleanup(lambda: ctx.runtime.submit(ctx.engine.stop()).result(timeout=5))
         ctx.engine.start = _noop                 # без настоящих загрузок
         root = win.tree.add_root("Съёмка", BrowseContext(source=SourceKind.PUBLIC, public_key="k"),

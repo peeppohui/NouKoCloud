@@ -105,19 +105,23 @@ class DownloadEngine:
 
     # ------------------------------------------------------------------
     async def start(self) -> None:
-        if self._workers:
-            return
+        """Готовим движок к работе.
+
+        Рабочих мы не создаём заранее: пока нет заданий, они бы всё
+        равно молчали в фоне. Появятся — когда появится первая загрузка.
+        """
         self._closing = False
-        # Пул потоков всегда одного размера, а сколько работают одновременно
-        # решает лимит — его можно менять на ходу.
-        for index in range(MAX_WORKERS):
+
+    def _spawn_workers(self, count: int) -> None:
+        """Добираем рабочих до нужного числа (лимит может вырасти на ходу)."""
+        while len(self._workers) < min(MAX_WORKERS, max(1, count)):
+            index = len(self._workers)
             self._workers.append(asyncio.create_task(self._worker(), name=f"dl-{index}"))
-        log.info("Движок загрузок запущен (файлов одновременно: %d)",
-                 self._config.max_parallel_files)
 
     async def apply_config(self) -> None:
         """Применяет новые настройки без перезапуска программы."""
         await self._file_limit.set_limit(self._config.max_parallel_files)
+        self._spawn_workers(self._config.max_parallel_files)
         log.info("Новые настройки применены: файлов одновременно %d",
                  self._config.max_parallel_files)
 
@@ -151,6 +155,11 @@ class DownloadEngine:
         log.info("В очередь добавлено файлов: %d", len(created))
         self._emit_snapshot()
         await self.start()
+        if created:
+            # Рабочие поднимаем только когда есть что качать.
+            self._spawn_workers(self._config.max_parallel_files)
+            log.info("Движок загрузок запущен (файлов одновременно: %d)",
+                     self._config.max_parallel_files)
         return created
 
     def _free_name(self, name: str, file: CloudFile, dest_dir: Path) -> str:

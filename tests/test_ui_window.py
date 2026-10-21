@@ -53,6 +53,9 @@ class TestMainWindow(unittest.TestCase):
         except Exception:
             pass
         self.ctx.cache.close()
+        # Фоновой цикл тоже гасим: иначе его задачи остаются «незабранными»
+        # и при выходе asyncio пишет «Task was destroyed but it is pending».
+        self.ctx.runtime.stop()
 
     def _fill_tree(self, count: int) -> None:
         ctx = BrowseContext(source=SourceKind.PUBLIC, public_key="https://disk.yandex.ru/d/X")

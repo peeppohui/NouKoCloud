@@ -64,14 +64,19 @@ if ($LASTEXITCODE -ne 0) { throw "Сборка не удалась" }
 # --- Раскладываем рядом с exe ---
 if ($OneFile) {
     $target = "dist"                      # один файл: dist\NoukoCloud.exe
+    # В одно-файловом режиме spec ffmpeg не кладёт — копируем сами,
+    # содержимое папки (иначе получится bin\bin\).
+    if (Test-Path "bin") {
+        New-Item -ItemType Directory -Force -Path (Join-Path $target "bin") | Out-Null
+        Copy-Item -Recurse -Force "bin\*" (Join-Path $target "bin") -ErrorAction SilentlyContinue
+    }
 } else {
     $target = "dist\NoukoCloud"       # папка: dist\NoukoCloud\NoukoCloud.exe
+    # ffmpeg кладёт сам spec — и без ffprobe (−100 МБ). Копировать папку
+    # bin ещё раз нельзя: появится bin\bin\ и архив потолстеет вдвое.
 }
 
 Copy-Item -Recurse -Force docs (Join-Path $target "docs") -ErrorAction SilentlyContinue
-if (Test-Path "bin") {
-    Copy-Item -Recurse -Force bin (Join-Path $target "bin") -ErrorAction SilentlyContinue
-}
 
 # --- Ключи OAuth в portable-конфиг ---
 $portable = [ordered]@{

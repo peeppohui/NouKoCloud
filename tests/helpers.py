@@ -89,7 +89,22 @@ def start_range_server(payload: bytes):
 
 
 def stop_server(server) -> None:
-    server.shutdown()
+    """Останавливает сервер.
+
+    shutdown() ждёт, пока serve_forever заметит флаг остановки. Если висит
+    обработчик (например, открытый поток ответа), ждать нечего — тест всё
+    равно должен идти дальше, поэтому ждём недолго и идём дальше.
+    """
+    done = threading.Event()
+
+    def _shutdown() -> None:
+        try:
+            server.shutdown()
+        finally:
+            done.set()
+
+    threading.Thread(target=_shutdown, daemon=True).start()
+    done.wait(timeout=5)
     server.server_close()
 
 
