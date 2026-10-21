@@ -51,4 +51,4 @@ python tools\publish_release.py --version $Version
 if ($LASTEXITCODE -ne 0) { throw "Публикация не удалась" }
 
 Write-Host "`nГотово. Постоянная ссылка на скачивание:" -ForegroundColor Green
-Write-Host "https://github.com/peeppohui/NowKoCloud/releases/latest/download/NoukoCloud-win64.zip" -ForegroundColor Green
+Write-Host "https://github.com/peeppohui/NouKoCloud/releases/latest/download/NoukoCloud-win64.zip" -ForegroundColor Green

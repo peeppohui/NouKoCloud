@@ -21,7 +21,7 @@ from pathlib import Path
 
 import httpx
 
-REPO = "peeppohui/NowKoCloud"
+REPO = "peeppohui/NouKoCloud"
 ASSET_NAME = "NoukoCloud-win64.zip"      # имя постоянное — ссылка не должна ломаться
 ROOT = Path(__file__).resolve().parent.parent
 ARCHIVE = ROOT / "release" / ASSET_NAME
@@ -77,7 +77,7 @@ CHANGES = """* **Ссылка на скачивание снова работа�
   поднимаются только тогда, когда есть что качать.
 
 В 0.5.0 было: **переименование в «НоуКо Cloud»** (файл `NoukoCloud.exe`,
-репозиторий `peeppohui/NowKoCloud`; старые ссылки и настройки работают),
+репозиторий `peeppohui/NouKoCloud`; старые ссылки и настройки работают),
 новый дизайн, **вкладка «Соцсети»** (видео и звук с YouTube, TikTok,
 Instagram, VK, Rutube, Дзена и сотен других сайтов), **предпросмотр и
 скачивание фрагментов** (клавиши I и O — начало и конец), ускоренная докачка
