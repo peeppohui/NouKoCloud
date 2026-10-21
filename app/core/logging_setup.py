@@ -64,6 +64,12 @@ class _ConsoleFormatter(logging.Formatter):
         super().__init__("%(levelname)s: %(message)s")
 
 
+def level_from_name(name: str) -> int:
+    """«INFO» → logging.INFO. Незнакомое имя — INFO."""
+    value = (name or "").strip().upper()
+    return getattr(logging, value, logging.INFO) if value else logging.INFO
+
+
 def setup_logging(level: int = logging.INFO) -> Path:
     """Настраивает журналы и перехват ошибок. Возвращает путь к основному журналу."""
     global _CONFIGURED
@@ -77,7 +83,9 @@ def setup_logging(level: int = logging.INFO) -> Path:
     file_handler = logging.handlers.RotatingFileHandler(
         folder / LOG_NAME, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8", delay=False
     )
-    file_handler.setLevel(logging.DEBUG)
+    # Уровень из настроек: по умолчанию INFO — в журнале остаётся всё важное,
+    # но без служебного шума от asyncio и httpx.
+    file_handler.setLevel(level)
     file_handler.setFormatter(_PlainFormatter())
     root.addHandler(file_handler)
 

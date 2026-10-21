@@ -9,6 +9,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QBoxLayout,
     QCheckBox,
+    QComboBox,
     QDialog,
     QDoubleSpinBox,
     QDialogButtonBox,
@@ -210,6 +211,13 @@ class SettingsDialog(OverlayDialog):
         self._use_segments = QCheckBox("Докачивать большие файлы по частям", downloads_box)
         self._use_segments.setChecked(config.use_segments)
         downloads.addWidget(self._use_segments)
+        self._keep_parts = QCheckBox("Хранить недокачанные файлы", downloads_box)
+        self._keep_parts.setChecked(config.keep_partial_files)
+        self._keep_parts.setToolTip(
+            "Отменённая загрузка останется на диске — её можно продолжить "
+            "при следующем запуске программы."
+        )
+        downloads.addWidget(self._keep_parts)
         right.addWidget(downloads_box)
 
         # --- Превью ---
@@ -302,6 +310,22 @@ class SettingsDialog(OverlayDialog):
         usage_row.addStretch(1)
         preview.addLayout(usage_row)
         right.addWidget(preview_box)
+
+        logs_box = QGroupBox("ЖУРНАЛ", self.body)
+        logs = QHBoxLayout(logs_box)
+        logs.setSpacing(12)
+        logs.addWidget(label("Уровень журнала", None, logs_box))
+        self._log_level = QComboBox(logs_box)
+        self._log_level.addItems(["DEBUG", "INFO", "WARNING", "ERROR"])
+        current = (config.log_level or "INFO").upper()
+        self._log_level.setCurrentIndex(max(0, self._log_level.findText(current)))
+        self._log_level.setToolTip(
+            "Подробность журнала. В файле по умолчанию INFO: видно всё важное "
+            "и без служебного шума. Ошибки всегда пишутся в errors.log."
+        )
+        logs.addWidget(self._log_level)
+        logs.addStretch(1)
+        right.addWidget(logs_box)
         right.addStretch(1)
 
         self._dir.textChanged.connect(self._update_cache_info)
@@ -419,6 +443,7 @@ class SettingsDialog(OverlayDialog):
         config.segment_min_mb = self._segment_mb.value()
         config.use_segments = self._use_segments.isChecked()
         config.download_speed_limit_mbps = self._speed.value()
+        config.keep_partial_files = self._keep_parts.isChecked()
         config.ffmpeg_path = self._ffmpeg.text().strip()
         config.ui_motion = self._ui_motion.isChecked()
         config.ui_sounds = self._ui_sounds.isChecked()
@@ -426,6 +451,7 @@ class SettingsDialog(OverlayDialog):
         config.run_in_background = self._run_bg.isChecked()
         if self._autostart.isEnabled() and self._autostart.isChecked() != autostart.enabled():
             autostart.set_enabled(self._autostart.isChecked())
+        config.log_level = self._log_level.currentText()
 
         old_cache = self._current_cache_path()
         config.preview_cache_dir = self._cache_dir.text().strip()

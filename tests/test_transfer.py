@@ -15,7 +15,7 @@ from app.downloader.transfer import Transfer, TransferContext
 from app.net.http_client import HttpClient
 from app.net.ratelimit import RateLimiter
 
-from .helpers import RangeHandler, start_range_server, stop_server
+from .helpers import RangeHandler, reset_handler_counters, start_range_server, stop_server
 
 PAYLOAD = bytes((i * 37 + 11) % 256 for i in range(3 * 1024 * 1024 + 4321))
 
@@ -197,6 +197,28 @@ class TestTransfer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.tmp / "test (1).mp4").read_bytes(), PAYLOAD)
         self.assertEqual(job.file.name, "test (1).mp4")
 
+    async def test_unknown_size_is_not_taken_for_downloaded(self) -> None:
+        """Файл без известного размера не должен молча помечаться «уже скачан»."""
+        config = make_config(self.tmp)
+        (self.tmp / "test.mp4").write_bytes(b"other file too")
+        job = make_job(self.tmp)
+        job.file.size = 0
+        transfer = Transfer(make_context(config, self.http, self.registry))
+        await transfer.run(job)
+        self.assertNotEqual(job.state.name, "SKIPPED")
+        self.assertEqual((self.tmp / "test.mp4").read_bytes(), b"other file too")
+        self.assertEqual((self.tmp / "test (1).mp4").read_bytes(), PAYLOAD)
+
+    async def test_empty_file_is_taken_for_downloaded(self) -> None:
+        """Настоящий пустой файл (размер 0) повторно не качаем."""
+        config = make_config(self.tmp)
+        (self.tmp / "test.mp4").write_bytes(b"")
+        job = make_job(self.tmp)
+        job.file.size = 0
+        transfer = Transfer(make_context(config, self.http, self.registry))
+        await transfer.run(job)
+        self.assertEqual(job.state.name, "SKIPPED")
+
     async def test_unknown_size_cut_is_not_accepted(self) -> None:
         """Файл без известного размера, оборванный сервером, не считается скачанным."""
         config = make_config(self.tmp, max_retries=1)
@@ -218,6 +240,31 @@ class TestTransfer(unittest.IsolatedAsyncioTestCase):
         transfer = Transfer(make_context(config, self.http, self.registry))
         await transfer.run(job)
         self.assertEqual((self.tmp / "test.mp4").read_bytes(), PAYLOAD)
+
+    async def test_short_stream_is_not_taken_as_complete(self) -> None:
+        """Облако обещало больше, чем отдало, — файл не должен считаться скачанным."""
+        config = make_config(self.tmp, max_retries=0)
+        job = make_job(self.tmp)
+        job.file.size = len(PAYLOAD) + 4096
+        transfer = Transfer(make_context(config, self.http, self.registry))
+        with self.assertRaises(Exception):
+            await transfer.run(job)
+        self.assertFalse((self.tmp / "test.mp4").exists())
+
+    async def test_segments_of_one_file_run_in_parallel_but_not_more(self) -> None:
+        """«Частей одного файла» должно ограничивать число одновременных запросов."""
+        reset_handler_counters()
+        RangeHandler.delay = 0.15          # запросы должны пересекаться по времени
+        try:
+            config = make_config(self.tmp, max_parallel_segments=2, segment_min_mb=1)
+            job = make_job(self.tmp)
+            transfer = Transfer(make_context(config, self.http, self.registry))
+            await transfer.run(job)
+        finally:
+            RangeHandler.delay = 0.0
+        self.assertGreater(RangeHandler.max_in_flight, 1, "сегменты должны идти параллельно")
+        self.assertLessEqual(RangeHandler.max_in_flight, 2,
+                             "но не больше, чем разрешено настройкой")
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ import sys
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QByteArray, QEvent, QObject, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
@@ -158,6 +158,7 @@ class MainWindow(FramelessWindow, QMainWindow):
         app = QApplication.instance()
         if app is not None:
             install_motion(app)
+        self._restore_geometry()
 
         self._build_ui()
         self._connect_bus()
@@ -167,6 +168,21 @@ class MainWindow(FramelessWindow, QMainWindow):
         self._on_checked_changed(0)
 
         QTimer.singleShot(0, self._after_start)
+
+    # ------------------------------------------------------------------
+    def _restore_geometry(self) -> None:
+        """Возвращает окно к тому виду, в каком его закрыли.
+
+        Раньше размер и положение окна только сохранялись, но не
+        восстанавливались — программа всегда открывалась 1280×820.
+        """
+        data = self.ctx.config.window_geometry
+        if not data:
+            return
+        try:
+            self.restoreGeometry(QByteArray.fromBase64(data.encode("ascii")))
+        except Exception:
+            log.debug("Не удалось восстановить размер окна", exc_info=True)
 
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
@@ -599,6 +615,8 @@ class MainWindow(FramelessWindow, QMainWindow):
             self.ctx.oauth.reload_config()
             self._apply_ui_prefs()
             self._sync_close_tooltip()
+            # Лимит файлов и паузы применяются сразу — перезапуск не нужен.
+            self.ctx.runtime.submit(self.ctx.engine.apply_config())
             self._on_notice("info", "Настройки сохранены")
         self._restore_nav()
 
@@ -1015,8 +1033,9 @@ class MainWindow(FramelessWindow, QMainWindow):
         try:
             self.ctx.config.window_geometry = self.saveGeometry().toBase64().data().decode()
             self.ctx.config.save()
-        except Exception:
-            pass
+        except Exception as exc:
+            # Настройки не сохранились — пользователь об этом должен знать.
+            log.warning("Не удалось сохранить настройки окна: %s", exc)
         future = self.ctx.runtime.submit(self.ctx.shutdown())
         try:
             future.result(timeout=8)

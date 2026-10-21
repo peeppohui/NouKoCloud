@@ -16,6 +16,7 @@ from ..core.errors import friendly_error
 from ..core.models import CloudFile, DownloadJob, JobState
 from ..net.http_client import HttpClient
 from ..net.metadata_cache import MetadataCache
+from ..net.speed import SpeedLimiter
 from ..providers.registry import ProviderRegistry
 from .state import find_states, load_state, save_state, state_dest
 from .transfer import Cancelled, Transfer, TransferContext, _discard_partial
@@ -24,12 +25,42 @@ log = logging.getLogger(__name__)
 
 PROGRESS_INTERVAL = 0.3      # как часто обновлять интерфейс
 STATE_SAVE_INTERVAL = 2.0    # как часто сохранять состояние на диск
+MAX_WORKERS = 16             # потоков в пуле; сколько работают — задаёт лимит
 
 _FORBIDDEN = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
 def _same_file(a: CloudFile, b: CloudFile) -> bool:
     return (a.provider, a.file_id, a.path, a.public_key) == (b.provider, b.file_id, b.path, b.public_key)
+
+
+class _Limit:
+    """Счётчик одновременных задач, лимит которого можно менять на ходу.
+
+    Обычный asyncio.Semaphore менять нельзя, а «Файлов одновременно» в
+    настройках должно действовать сразу, без перезапуска программы.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._limit = max(1, limit)
+        self._used = 0
+        self._cond = asyncio.Condition()
+
+    async def acquire(self) -> None:
+        async with self._cond:
+            while self._used >= self._limit:
+                await self._cond.wait()
+            self._used += 1
+
+    async def release(self) -> None:
+        async with self._cond:
+            self._used = max(0, self._used - 1)
+            self._cond.notify_all()
+
+    async def set_limit(self, limit: int) -> None:
+        async with self._cond:
+            self._limit = max(1, limit)
+            self._cond.notify_all()
 
 
 def _safe_name(name: str) -> str:
@@ -59,11 +90,13 @@ class DownloadEngine:
         self._jobs: dict[str, DownloadJob] = {}
         self._order: list[str] = []
         self._workers: list[asyncio.Task] = []
-        self._file_sem = asyncio.Semaphore(max(1, config.max_parallel_files))
+        self._file_limit = _Limit(config.max_parallel_files)
         self._stream_sem = asyncio.Semaphore(max(2, config.max_parallel_files * config.max_parallel_segments))
+        # Ограничитель скорости общий на все файлы.
+        self._speed = SpeedLimiter(config)
         self._closing = False
-        self._last_emit = 0.0
-        self._last_save = 0.0
+        self._last_emit: dict[str, float] = {}
+        self._last_save: dict[str, float] = {}
         self._running: set[str] = set()
         #: Задачи идущих загрузок: отмена прерывает их сразу, не дожидаясь
         #: следующего куска данных от медленного облака.
@@ -75,9 +108,18 @@ class DownloadEngine:
         if self._workers:
             return
         self._closing = False
-        for index in range(max(1, self._config.max_parallel_files)):
+        # Пул потоков всегда одного размера, а сколько работают одновременно
+        # решает лимит — его можно менять на ходу.
+        for index in range(MAX_WORKERS):
             self._workers.append(asyncio.create_task(self._worker(), name=f"dl-{index}"))
-        log.info("Движок загрузок запущен (%d потоков)", len(self._workers))
+        log.info("Движок загрузок запущен (файлов одновременно: %d)",
+                 self._config.max_parallel_files)
+
+    async def apply_config(self) -> None:
+        """Применяет новые настройки без перезапуска программы."""
+        await self._file_limit.set_limit(self._config.max_parallel_files)
+        log.info("Новые настройки применены: файлов одновременно %d",
+                 self._config.max_parallel_files)
 
     async def stop(self) -> None:
         self._closing = True
@@ -203,9 +245,13 @@ class DownloadEngine:
         self._interrupt(job_id)
         # Прогресс упавшей загрузки сохраняем: её подхватит recover().
         if job_id not in self._running and job.state is not JobState.FAILED:
-            self._drop_unfinished(job)
+            # Убираем из списка — но «Хранить недокачанные файлы» может
+            # оставить .part на диске, чтобы вернуться к нему позже.
+            self._drop_unfinished(job, keep=True)
         if job.job_id in self._order:
             self._order.remove(job.job_id)
+        self._last_emit.pop(job_id, None)
+        self._last_save.pop(job_id, None)
         self._emit_snapshot()
 
     async def clear_finished(self) -> None:
@@ -216,20 +262,24 @@ class DownloadEngine:
     # ------------------------------------------------------------------
     async def _worker(self) -> None:
         while not self._closing:
+            # Сначала место, потом работа. Наоборот нельзя: воркеров в пуле
+            # больше, чем лимит файлов, и они забирали бы задания из очереди
+            # наперегонки — и порядок загрузок перепутывался бы.
+            await self._file_limit.acquire()
             try:
                 job_id = await self._queue.get()
             except asyncio.CancelledError:
+                await self._file_limit.release()
                 return
-            job = self._jobs.get(job_id)
-            if job is None:
+            try:
+                job = self._jobs.get(job_id)
+                if job is not None and job.state is not JobState.CANCELLED:
+                    await self._run_job(job)
+            finally:
+                # task_done — строго для каждого взятого задания, иначе
+                # очередь не сойдётся.
                 self._queue.task_done()
-                continue
-            async with self._file_sem:
-                if job.state is JobState.CANCELLED:
-                    self._queue.task_done()
-                    continue
-                await self._run_job(job)
-            self._queue.task_done()
+                await self._file_limit.release()
 
     async def _run_job(self, job: DownloadJob) -> None:
         job.state = JobState.RUNNING
@@ -244,6 +294,7 @@ class DownloadEngine:
             config=self._config,
             streams_semaphore=self._stream_sem,
             on_progress=self._on_progress,
+            speed_limiter=self._speed,
         )
         transfer = Transfer(ctx)
 
@@ -294,25 +345,37 @@ class DownloadEngine:
         if task is not None and not task.done():
             task.cancel()
 
-    @staticmethod
-    def _drop_unfinished(job: DownloadJob) -> None:
-        """Удаляет .part и .part.json, иначе recover() поднимет задание снова."""
-        if job.state not in (JobState.DONE, JobState.SKIPPED):
-            _discard_partial(job)
+    def _drop_unfinished(self, job: DownloadJob, keep: bool = False) -> None:
+        """Убирает .part и .part.json, чтобы recover() не поднял загрузку заново.
+
+        keep=True — не убирать, если пользователь просил хранить недокачанное.
+        """
+        if job.state in (JobState.DONE, JobState.SKIPPED):
+            return
+        if keep and self._config.keep_partial_files:
+            # Пользователь попросил хранить недокачанное: файл и состояние
+            # остаются на диске, загрузку можно продолжить позже.
+            return
+        _discard_partial(job)
 
     # ------------------------------------------------------------------
     def _on_progress(self, job: DownloadJob) -> None:
         now = time.monotonic()
         self._update_speed(job, now)
-        if now - self._last_emit >= PROGRESS_INTERVAL:
-            self._last_emit = now
+        # Троттлинг — на каждое задание, а не на весь движок: иначе при
+        # четырёх файлах только один получал обновление, а у остальных
+        # полосы врут и состояние на диск пишется редко.
+        job_id = job.job_id
+        if now - self._last_emit.get(job_id, 0.0) >= PROGRESS_INTERVAL:
+            self._last_emit[job_id] = now
             self._bus.job_progress.emit(job)
-        if now - self._last_save >= STATE_SAVE_INTERVAL:
-            self._last_save = now
+        if now - self._last_save.get(job_id, 0.0) >= STATE_SAVE_INTERVAL:
+            self._last_save[job_id] = now
             try:
                 save_state(job)
             except Exception as exc:
-                log.debug("Не удалось сохранить состояние: %s", exc)
+                # Состояние не пишется — после обрыва придётся качать заново.
+                log.warning("Не удалось сохранить состояние загрузки: %s", exc)
 
     def _update_speed(self, job: DownloadJob, now: float) -> None:
         """Скорость считаем скользящим окном в 3 секунды."""

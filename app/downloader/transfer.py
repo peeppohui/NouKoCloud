@@ -19,7 +19,9 @@ import httpx
 
 from ..core.config import AppConfig
 from ..core.models import CloudFile, DownloadJob, DownloadLink, JobState, Segment
+from ..net.backoff import RetryPolicy, compute_delay
 from ..net.http_client import HttpClient
+from ..net.speed import SpeedLimiter
 from ..providers.registry import ProviderRegistry
 from ..core.paths import hide_path
 from .segments import plan_segments, validate_segments
@@ -66,27 +68,7 @@ class TransferContext:
     config: AppConfig
     streams_semaphore: asyncio.Semaphore
     on_progress: Callable[[DownloadJob], None]
-
-
-class _SpeedLimiter:
-    """Ограничитель скорости (Мбит/с). 0 — без ограничения."""
-
-    def __init__(self, mbps: int) -> None:
-        self.limit = (mbps * 1_000_000) / 8 if mbps else 0.0
-        self._tokens = self.limit
-        self._updated = time.monotonic()
-
-    async def consume(self, count: int) -> None:
-        if not self.limit:
-            return
-        while True:
-            now = time.monotonic()
-            self._tokens = min(self.limit, self._tokens + (now - self._updated) * self.limit)
-            self._updated = now
-            if self._tokens >= count:
-                self._tokens -= count
-                return
-            await asyncio.sleep(min((count - self._tokens) / self.limit, 1.0))
+    speed_limiter: Optional[SpeedLimiter] = None
 
 
 class Transfer:
@@ -95,7 +77,14 @@ class Transfer:
     def __init__(self, ctx: TransferContext) -> None:
         self._ctx = ctx
         self._config = ctx.config
-        self._speed = _SpeedLimiter(ctx.config.download_speed_limit_mbps)
+        # Ограничитель общий на все файлы (см. SpeedLimiter).
+        self._speed = ctx.speed_limiter or SpeedLimiter(ctx.config)
+        # Паузы между попытками — по настройкам, а не по своему минимуму.
+        self._policy = RetryPolicy(
+            max_attempts=max(1, ctx.config.max_retries),
+            base_delay=ctx.config.retry_base_delay,
+            max_delay=ctx.config.retry_max_delay,
+        )
 
     # ------------------------------------------------------------------
     async def run(self, job: DownloadJob) -> bool:
@@ -167,11 +156,19 @@ class Transfer:
             name = file.name if attempt == 0 else f"{stem} ({attempt}){suffix}"
             final = job.dest_dir / name
             if final.exists():
-                if file.size and final.stat().st_size == file.size:
+                on_disk = final.stat().st_size
+                if file.size:
+                    if on_disk == file.size:
+                        job.file = replace(file, name=name)
+                        return True
+                elif on_disk == 0:
+                    # Размер неизвестен (экспорт Google Документов, редкие
+                    # ответы API) — но пустой файл это точно тот же файл.
                     job.file = replace(file, name=name)
                     return True
-                if not file.size and attempt == 0:
-                    return True
+                # Размер неизвестен, а на диске что-то лежит: считать файл
+                # скачанным нельзя, это может быть совсем другой файл.
+                # Раньше здесь был «уже скачан» — пользователь получал пустоту.
                 continue
             if name != file.name:
                 log.info("%s уже есть и отличается — сохраняем как %s", file.name, name)
@@ -262,33 +259,40 @@ class Transfer:
         while not seg.done:
             if job.cancel_event.is_set():
                 raise Cancelled()
+            delay = 0.0
+            # Гейт держим ВО ВРЕМЯ самой передачи, а не только на её время
+            # запуска: иначе «Частей одного файла» ничего не ограничивал —
+            # слот освобождался сразу после старта запроса, и файл качался
+            # всеми сегментами сразу.
             async with gate:
                 await self._ctx.streams_semaphore.acquire()
-            try:
-                await self._pull_segment(job, seg, fd)
-                attempts = 0
-            except RangeNotSupported:
-                raise
-            except Cancelled:
-                raise
-            except ServerCutStream:
-                cuts += 1
-                if cuts >= 2:
-                    # Сервер стабильно обрывает передачу — переходим на один поток.
-                    raise
-                await asyncio.sleep(1.0)
-            except Exception as exc:
-                attempts += 1
-                if attempts > self._config.max_retries:
-                    raise
-                delay = min(2 ** attempts, 30)
-                log.warning("Сегмент %d: %s — повтор через %d с", seg.index, exc, delay)
-                await asyncio.sleep(delay)
-            finally:
                 try:
-                    self._ctx.streams_semaphore.release()
-                except ValueError:
-                    pass
+                    await self._pull_segment(job, seg, fd)
+                    attempts = 0
+                except RangeNotSupported:
+                    raise
+                except Cancelled:
+                    raise
+                except ServerCutStream:
+                    cuts += 1
+                    if cuts >= 2:
+                        # Сервер стабильно обрывает передачу — переходим на один поток.
+                        raise
+                    delay = 1.0
+                except Exception as exc:
+                    attempts += 1
+                    if attempts > self._config.max_retries:
+                        raise
+                    delay = compute_delay(attempts, None, self._policy)
+                    log.warning("Сегмент %d: %s — повтор через %d с", seg.index, exc, delay)
+                finally:
+                    try:
+                        self._ctx.streams_semaphore.release()
+                    except ValueError:
+                        pass
+            # Паузу делаем вне гейта, чтобы не держать слот во время ожидания.
+            if delay:
+                await asyncio.sleep(delay)
         job.downloaded_bytes = sum(s.received for s in job.segments)
 
     async def _pull_segment(self, job: DownloadJob, seg: Segment, fd: int) -> None:
@@ -421,6 +425,8 @@ class Transfer:
                 response.raise_for_status()
 
             offset = start
+            expected = max(0, seg.total - seg.received)
+            got = 0
             try:
                 async for chunk in response.aiter_bytes(CHUNK):
                     if not chunk:
@@ -428,12 +434,19 @@ class Transfer:
                     await self._checkpoint(job)
                     write_at(fd, chunk, offset)
                     offset += len(chunk)
+                    got += len(chunk)
                     seg.received += len(chunk)
                     job.downloaded_bytes = seg.received
                     self._ctx.on_progress(job)
                     await self._speed.consume(len(chunk))
             except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout) as exc:
                 raise ServerCutStream("сервер оборвал передачу") from exc
+            # Сервер мог тихо закончить поток, не прислать всё — в отличие от
+            # параллельного режима, обрыв тут раньше не замечался.
+            if expected and got < expected:
+                raise ServerCutStream(
+                    f"сервер прислал {got} байт вместо {expected}"
+                )
         finally:
             await response.aclose()
 
@@ -473,7 +486,12 @@ class Transfer:
         if job.file.md5:
             # MD5 многогигабайтного файла считается десятки секунд — не держим event loop.
             actual = await asyncio.to_thread(_md5_of, part)
-            if actual and actual.lower() != job.file.md5.lower():
+            if actual is None:
+                # Проверить не смогли — молча пропускать проверку нельзя,
+                # иначе битый файл уедет к монтажёру как нормальный.
+                _discard_partial(job)
+                raise IOError("Не удалось прочитать файл для проверки контрольной суммы")
+            if actual.lower() != job.file.md5.lower():
                 # Иначе повтор «докачает» нулевой остаток и снова упрётся в ту же сумму.
                 _discard_partial(job)
                 raise IOError("Контрольная сумма не совпала — файл повреждён")

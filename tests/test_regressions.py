@@ -152,6 +152,39 @@ class TestGoogleBrowserLogin(unittest.IsolatedAsyncioTestCase):
         await server.stop()
         self.assertEqual(server.redirect_uri, uri)
 
+    async def test_malformed_request_does_not_break_server(self) -> None:
+        """Мусорный запрос не должен ронять обработчик (был UnboundLocalError)."""
+        from app.oauth.loopback import LoopbackRedirectServer
+
+        server = LoopbackRedirectServer()
+        await server.start()
+        try:
+            port = server.port
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.write(b"GARBAGE\r\n\r\n")      # нет пути — .split(" ")[1] падал
+            await writer.drain()
+            await reader.read(200)
+            writer.close()
+
+            # После мусора сервер обязан по-прежнему ловить код.
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.write(b"GET /?code=XYZ HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            await writer.drain()
+            await reader.read(200)
+            writer.close()
+            code = await asyncio.wait_for(server.wait_for_code(), timeout=5)
+            self.assertEqual(code, "XYZ")
+        finally:
+            await server.stop()
+
+    def test_query_parsing_survives_garbage(self) -> None:
+        """Разбор строки запроса не должен падать на мусоре."""
+        from app.oauth.loopback import _query_of
+
+        self.assertEqual(_query_of(b"GET /?code=1 HTTP/1.1"), "/?code=1")
+        self.assertEqual(_query_of(b"GARBAGE\r\n"), "")
+        self.assertEqual(_query_of(b""), "")
+
 
 class TestGoogleDriveScope(unittest.TestCase):
     """Вход без галочки «Google Диск»: вход «успешен», а все запросы — 403."""
@@ -354,6 +387,155 @@ class TestCancel(unittest.IsolatedAsyncioTestCase):
             engine2 = DownloadEngine(config, None, None, None, mock.Mock())  # type: ignore[arg-type]
             self.assertEqual(await engine2.recover(dest), [])
             await engine2.stop()
+
+
+class TestLiveLimits(unittest.IsolatedAsyncioTestCase):
+    """Лимиты должны применяться сразу, без перезапуска программы."""
+
+    async def test_limit_can_be_changed_on_the_fly(self) -> None:
+        from app.downloader.engine import _Limit
+
+        limit = _Limit(1)
+        await limit.acquire()
+        waiter = asyncio.create_task(limit.acquire())
+        await asyncio.sleep(0.05)
+        self.assertFalse(waiter.done(), "второй должен ждать")
+        await limit.set_limit(2)
+        await asyncio.wait_for(waiter, timeout=2)
+        await limit.release()
+        await limit.release()
+
+    async def test_engine_applies_new_file_limit(self) -> None:
+        config = AppConfig()
+        config.max_parallel_files = 2
+        engine = DownloadEngine(config, None, None, None, mock.Mock())  # type: ignore[arg-type]
+        config.max_parallel_files = 7
+        await engine.apply_config()
+        self.assertEqual(engine._file_limit._limit, 7)
+
+
+class TestKeepPartialFiles(unittest.IsolatedAsyncioTestCase):
+    """«Хранить недокачанные файлы» — настройка должна работать."""
+
+    async def test_removing_job_keeps_partial_when_asked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp)
+            config = AppConfig()
+            config.download_dir = tmp
+            config.keep_partial_files = True
+            engine = DownloadEngine(config, None, None, None, mock.Mock())  # type: ignore[arg-type]
+            file = CloudFile(provider=ProviderId.YANDEX, file_id="1", path="/a.mp4", name="a.mp4",
+                             kind=EntryKind.FILE, size=100, source=SourceKind.PUBLIC)
+            job = DownloadJob(file=file, dest_dir=dest)
+            job.parts_dir.mkdir(parents=True, exist_ok=True)
+            job.part_path.write_bytes(b"\0" * 100)
+            save_state(job)
+            engine._jobs[job.job_id] = job
+            engine._order.append(job.job_id)
+
+            await engine.remove(job.job_id)
+            self.assertTrue(job.part_path.exists(), "недокачанный файл должен остаться")
+
+    async def test_cancelled_job_always_removes_partial(self) -> None:
+        """Отмена пользователем — это отмена: файл убираем независимо от настройки."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp)
+            config = AppConfig()
+            config.download_dir = tmp
+            config.keep_partial_files = True
+            engine = DownloadEngine(config, None, None, None, mock.Mock())  # type: ignore[arg-type]
+            file = CloudFile(provider=ProviderId.YANDEX, file_id="1", path="/a.mp4", name="a.mp4",
+                             kind=EntryKind.FILE, size=100, source=SourceKind.PUBLIC)
+            job = DownloadJob(file=file, dest_dir=dest)
+            job.parts_dir.mkdir(parents=True, exist_ok=True)
+            job.part_path.write_bytes(b"\0" * 100)
+            save_state(job)
+            engine._jobs[job.job_id] = job
+            engine._order.append(job.job_id)
+
+            await engine.cancel(job.job_id)
+            self.assertFalse(job.part_path.exists())
+            self.assertFalse(job.state_path.exists())
+            await engine.stop()
+
+
+class TestDownloadOrder(unittest.IsolatedAsyncioTestCase):
+    """Порядок загрузок должен совпадать с порядком в очереди.
+
+    Раньше воркеров в пуле было больше, чем лимит файлов, и они забирали
+    задания наперегонки — файл №3 мог стартовать раньше файла №2.
+    """
+
+    async def test_files_start_in_order(self) -> None:
+        import tempfile as _tempfile
+
+        with _tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig()
+            config.download_dir = tmp
+            config.max_parallel_files = 2
+            engine = DownloadEngine(config, None, None, None, mock.Mock())  # type: ignore[arg-type]
+
+            started: list[str] = []
+            release = asyncio.Event()
+
+            async def fake_run(job) -> None:
+                started.append(job.file.name)
+                await release.wait()
+
+            engine._run_job = fake_run  # type: ignore[assignment]
+            await engine.start()
+
+            files = []
+            for index in range(6):
+                file = CloudFile(provider=ProviderId.YANDEX, file_id=str(index),
+                                 path=f"/{index}.mp4", name=f"{index}.mp4",
+                                 kind=EntryKind.FILE, size=100, source=SourceKind.PUBLIC)
+                files.append(file)
+            await engine.enqueue(files, Path(tmp))
+
+            await asyncio.sleep(0.3)
+            release.set()
+            await asyncio.sleep(0.3)
+
+            self.assertEqual(started, sorted(started), "файлы должны начинать по порядку")
+            await engine.stop()
+
+
+class TestProgressThrottle(unittest.TestCase):
+    """Прогресс и сохранение состояния — на каждое задание, а не на движок.
+
+    Раньше троттлинг был общий: при четырёх файлах только один получал
+    обновление интерфейса, а состояние на диск писалось для одного из них.
+    """
+
+    def test_every_job_gets_its_own_progress(self) -> None:
+        config = AppConfig()
+        bus = mock.Mock()
+        engine = DownloadEngine(config, None, None, None, bus)  # type: ignore[arg-type]
+        jobs = []
+        for index in range(3):
+            file = CloudFile(provider=ProviderId.YANDEX, file_id=str(index), path=f"/{index}.mp4",
+                             name=f"{index}.mp4", kind=EntryKind.FILE, size=100,
+                             source=SourceKind.PUBLIC)
+            jobs.append(DownloadJob(file=file, dest_dir=Path(".")))
+
+        for job in jobs:
+            engine._on_progress(job)
+
+        emitted = [call.args[0] for call in bus.job_progress.emit.call_args_list]
+        self.assertEqual(len(emitted), 3, "каждое задание должно получить свой прогресс")
+        self.assertEqual({job.job_id for job in emitted}, {job.job_id for job in jobs})
+
+    def test_repeated_progress_of_one_job_is_throttled(self) -> None:
+        config = AppConfig()
+        bus = mock.Mock()
+        engine = DownloadEngine(config, None, None, None, bus)  # type: ignore[arg-type]
+        file = CloudFile(provider=ProviderId.YANDEX, file_id="1", path="/a.mp4", name="a.mp4",
+                         kind=EntryKind.FILE, size=100, source=SourceKind.PUBLIC)
+        job = DownloadJob(file=file, dest_dir=Path("."))
+        for _ in range(20):
+            engine._on_progress(job)
+        self.assertLessEqual(len(bus.job_progress.emit.call_args_list), 2)
 
 
 class TestBrokenCache(unittest.TestCase):

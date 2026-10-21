@@ -7,6 +7,7 @@ import http.server
 import os
 import socket
 import threading
+import time
 
 
 class RangeHandler(http.server.BaseHTTPRequestHandler):
@@ -16,12 +17,28 @@ class RangeHandler(http.server.BaseHTTPRequestHandler):
     served_bytes = 0
     hit_count = 0
     fail_after: int | None = None   # оборвать соединение после N байт
+    delay = 0.0                     # пауза перед отдачей — видно параллелизм
+    in_flight = 0                   # запросов прямо сейчас
+    max_in_flight = 0               # максимум одновременных запросов
+    _lock = threading.Lock()
 
     def log_message(self, *args):  # noqa: D102 - глушим вывод
         pass
 
     def do_GET(self):  # noqa: N802
         RangeHandler.hit_count += 1
+        with RangeHandler._lock:
+            RangeHandler.in_flight += 1
+            RangeHandler.max_in_flight = max(
+                RangeHandler.max_in_flight, RangeHandler.in_flight
+            )
+        try:
+            self._serve()
+        finally:
+            with RangeHandler._lock:
+                RangeHandler.in_flight -= 1
+
+    def _serve(self) -> None:
         data = self.payload
         total = len(data)
         range_header = self.headers.get("Range")
@@ -47,7 +64,10 @@ class RangeHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
         self.end_headers()
 
-        limit = self.fail_after
+        if RangeHandler.delay:
+            time.sleep(RangeHandler.delay)
+
+        limit = RangeHandler.fail_after
         if limit is not None and limit < len(chunk):
             try:
                 self.wfile.write(chunk[:limit])
@@ -71,6 +91,16 @@ def start_range_server(payload: bytes):
 def stop_server(server) -> None:
     server.shutdown()
     server.server_close()
+
+
+def reset_handler_counters() -> None:
+    """Обнуляет счётчики сервера — чтобы тесты не зависели друг от друга."""
+    RangeHandler.served_bytes = 0
+    RangeHandler.hit_count = 0
+    RangeHandler.max_in_flight = 0
+    RangeHandler.in_flight = 0
+    RangeHandler.delay = 0.0
+    RangeHandler.fail_after = None
 
 
 def free_port() -> int:

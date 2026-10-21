@@ -91,6 +91,12 @@ _STATUS_TEXT = {
 
 # Тексты, которые облака возвращают в теле ответа.
 _BODY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    # Google: публичная папка без API-ключа. Без ключа Google отвечает 403
+    # «Method doesn't allow unregistered callers» — без этой подсказки
+    # пользователю казалось бы, что к нему нет доступа.
+    (re.compile(r"unregistered callers|use API Key|API consumer identity", re.I),
+     "Нужен Google API Key. Впишите его в «Настройках» (или войдите в аккаунт) — "
+     "без ключа Google не пускает даже публичные папки."),
     # Google: при входе не отмечена галочка «Google Диск» (вход есть, прав на файлы нет).
     # Должно стоять раньше общего insufficientPermissions — иначе пользователю
     # советовали бы «попросить владельца», хотя дело в его собственном входе.
