@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QImage, QImageReader, QPixmap
+from PySide6.QtGui import QColor, QImage, QImageReader, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -43,6 +44,15 @@ except Exception as exc:  # pragma: no cover - сборка без QtMultimedia
     MULTIMEDIA_AVAILABLE = False
 
 SEEK_STEP_MS = 5000
+FINE_STEP_MS = 1000            # Shift + стрелка
+#: Звук отдельной дорожкой (YouTube). Звук — главные часы, его не трогаем
+#: (каждая перемотка звука — пауза в звуке). Видео догоняет его скоростью:
+#: расхождение больше AV_DRIFT_MS — скорость видео ±до AV_MAX_RATE_SHIFT;
+#: больше AV_JUMP_MS — видео перематывается к звуку.
+AV_DRIFT_MS = 60
+AV_JUMP_MS = 1000
+AV_MAX_RATE_SHIFT = 0.10
+AV_START_TIMEOUT_S = 3.0      # звук так и не зазвучал — видео всё равно пускаем
 # Буферизация: меньше этого запаса впереди (в секундах видео) — ставим паузу,
 # а не показываем рваное видео по 3 кадра в секунду.
 LOW_WATER_S = 0.8
@@ -91,6 +101,50 @@ class SeekSlider(QSlider):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(Qt.Orientation.Horizontal, parent)
+        self._marks: tuple[int | None, int | None] = (None, None)
+
+    def set_marks(self, start: int | None, end: int | None) -> None:
+        """Отметки фрагмента (мс): подсвеченный участок и риски по краям."""
+        self._marks = (start, end)
+        self.update()
+
+    def _x_for(self, value: int) -> int:
+        option = QStyleOptionSlider()
+        self.initStyleOption(option)
+        handle = self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider, option, QStyle.SubControl.SC_SliderHandle, self
+        )
+        span = max(1, self.width() - handle.width())
+        return QStyle.sliderPositionFromValue(self.minimum(), self.maximum(), value, span) + handle.width() // 2
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        start, end = self._marks
+        if self.maximum() <= self.minimum() or (start is None and end is None):
+            super().paintEvent(event)
+            return
+        try:
+            from ..ui import theme as _theme
+
+            accent = QColor(_theme.current().text)
+        except Exception:  # pragma: no cover
+            accent = QColor("#ffffff")
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        mid = self.height() // 2
+        x0 = self._x_for(start if start is not None else self.minimum())
+        x1 = self._x_for(end if end is not None else self.maximum())
+        band = QColor(accent)
+        band.setAlpha(80)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(band)
+        painter.drawRoundedRect(min(x0, x1), mid - 7, abs(x1 - x0), 14, 4, 4)
+        painter.setBrush(accent)
+        for value in (start, end):
+            if value is not None:
+                x = self._x_for(value)
+                painter.drawRoundedRect(x - 2, mid - 10, 4, 20, 2, 2)
+        painter.end()
+        super().paintEvent(event)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton and self.maximum() > self.minimum():
@@ -166,6 +220,14 @@ class PreviewPlayer(QWidget):
         self._buffering = False     # мы сами поставили паузу, пока копится запас
         self._no_wait = False       # пользователь выбрал «смотреть сразу, без буфера»
         self._first_frame = False   # первый кадр уже на экране
+        self._aplayer = None        # звук отдельной дорожкой (у YouTube видео и звук раздельно)
+        self._stop_at: int | None = None   # «проиграть фрагмент»: пауза на этой позиции
+        self._av_timer = QTimer(self)
+        self._av_timer.setInterval(100)
+        self._av_start: tuple[int, float] | None = None  # старт: (позиция звука, когда запустили)
+        self._av_frame = False               # после перемотки видео уже показало кадр
+        self._av_wait_since = 0.0
+        self._av_timer.timeout.connect(self._sync_audio)
         self._buffer_timer = QTimer(self)
         self._buffer_timer.setInterval(BUFFER_CHECK_MS)
         self._buffer_timer.timeout.connect(self._check_buffer)
@@ -174,12 +236,10 @@ class PreviewPlayer(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
+        # Сцена: тёмная при любой теме — видео смотрят на тёмном (стиль «stage»).
         self._stack = QStackedWidget(self)
-        self._stack.setObjectName("previewStage")
-        self._stack.setStyleSheet(
-            "#previewStage, #previewStage > QWidget { background: #111317; border-radius: 8px; }"
-            "#previewStage QLabel { color: #c9ced6; background: transparent; }"
-        )
+        self._stack.setObjectName("stage")
+        self._stack.setMinimumHeight(200)
         layout.addWidget(self._stack, 1)
 
         self._message = QLabel(PLACEHOLDER, self._stack)
@@ -224,14 +284,25 @@ class PreviewPlayer(QWidget):
         # --- Панель управления ---------------------------------------
         self._controls = QWidget(self)
         row = QHBoxLayout(self._controls)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(8)
+        row.setContentsMargins(0, 4, 0, 0)
+        row.setSpacing(14)
 
         self._btn_play = QToolButton(self._controls)
+        self._btn_play.setProperty("kind", "play")
         self._btn_play.setToolTip("Воспроизвести / пауза (пробел)")
-        self._btn_play.setIconSize(QSize(22, 22))
+        self._btn_play.setAccessibleName("Воспроизвести или поставить на паузу")
+        self._btn_play.setFixedSize(44, 44)
+        self._btn_play.setIconSize(QSize(18, 18))
+        self._btn_play.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_play.clicked.connect(self.toggle_play)
         row.addWidget(self._btn_play)
+
+        self._time = QLabel("0:00 / 0:00", self._controls)
+        self._time.setProperty("role", "wide")
+        self._time.setStyleSheet("font-size: 12px;")
+        self._time.setMinimumWidth(96)
+        self._time.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(self._time)
 
         self._slider = SeekSlider(self._controls)
         self._slider.setRange(0, 0)
@@ -241,21 +312,20 @@ class PreviewPlayer(QWidget):
         self._slider.sliderMoved.connect(self._preview_time)
         row.addWidget(self._slider, 1)
 
-        self._time = QLabel("0:00 / 0:00", self._controls)
-        self._time.setMinimumWidth(110)
-        self._time.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        row.addWidget(self._time)
-
         self._btn_mute = QToolButton(self._controls)
+        self._btn_mute.setProperty("kind", "icon")
         self._btn_mute.setToolTip("Выключить / включить звук")
+        self._btn_mute.setAccessibleName("Звук")
+        self._btn_mute.setFixedSize(40, 40)
         self._btn_mute.setIconSize(QSize(20, 20))
+        self._btn_mute.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_mute.clicked.connect(self._toggle_mute)
         row.addWidget(self._btn_mute)
 
         self._volume = QSlider(Qt.Orientation.Horizontal, self._controls)
         self._volume.setRange(0, 100)
         self._volume.setValue(80)
-        self._volume.setFixedWidth(90)
+        self._volume.setFixedWidth(80)
         self._volume.setToolTip("Громкость")
         self._volume.valueChanged.connect(self._on_volume)
         row.addWidget(self._volume)
@@ -272,6 +342,7 @@ class PreviewPlayer(QWidget):
         self._status.setWordWrap(True)
         status_row.addWidget(self._status, 1)
         self._btn_no_wait = QPushButton("Смотреть сразу", self)
+        self._btn_no_wait.setProperty("kind", "soft")
         self._btn_no_wait.setToolTip(
             "Начать показ, не дожидаясь запаса. Видео тяжелее интернета, "
             "поэтому оно будет идти рывками, зато сразу видно, что в нём."
@@ -285,6 +356,16 @@ class PreviewPlayer(QWidget):
         self._sync_play_button()
         self._sync_mute_button()
         self._show_page(self._message)
+        try:
+            from ..ui import theme as _theme
+
+            _theme.manager().changed.connect(self._on_theme)
+        except Exception:  # pragma: no cover
+            pass
+
+    def _on_theme(self, _palette) -> None:
+        self._sync_play_button()
+        self._sync_mute_button()
 
     # ------------------------------------------------------------------
     # Публичный API
@@ -294,7 +375,7 @@ class PreviewPlayer(QWidget):
         return MULTIMEDIA_AVAILABLE
 
     def play(self, url: str, kind: str, title: str = "", autoplay: bool = True,
-             buffer_probe=None) -> None:
+             buffer_probe=None, audio_url: str = "") -> None:
         """Видео или аудио с адреса url (сервер превью).
 
         buffer_probe(доля) -> BufferState | None — сколько файла уже скачано
@@ -323,6 +404,15 @@ class PreviewPlayer(QWidget):
         self._buffering = False
         self._no_wait = False
         self._first_frame = kind != "video"   # у звука ждать кадр не нужно
+        if audio_url:
+            # Видео без звука + звук отдельно: звук играет второй плеер,
+            # он идёт за позицией видео (см. _sync_audio).
+            if self._aplayer is None:
+                self._aplayer = QMediaPlayer(self)
+            self._player.setAudioOutput(None)
+            self._aplayer.setAudioOutput(self._audio)
+            self._aplayer.setSource(QUrl(audio_url))
+            self._av_timer.start()
         self._player.setSource(QUrl(url))
         if autoplay:
             self._player.play()
@@ -360,6 +450,14 @@ class PreviewPlayer(QWidget):
         self._buffering = False
         self._no_wait = False
         self._btn_no_wait.setVisible(False)
+        self._stop_at = None
+        self._av_timer.stop()
+        if self._aplayer is not None:
+            self._aplayer.stop()
+            self._aplayer.setSource(QUrl())
+            self._aplayer.setAudioOutput(None)
+            if self._player is not None:
+                self._player.setAudioOutput(self._audio)
         if self._player is not None:
             self._player.stop()
             self._player.setSource(QUrl())
@@ -385,6 +483,7 @@ class PreviewPlayer(QWidget):
             self._set_status("")
         if self._player is not None and self._is_playing():
             self._player.pause()
+        self._sync_audio()
         self._sync_play_button()
 
     def toggle_play(self) -> None:
@@ -403,6 +502,101 @@ class PreviewPlayer(QWidget):
     @property
     def buffering(self) -> bool:
         return self._buffering
+
+    # --- позиция и фрагменты (вкладка «Соцсети») ------------------------
+    def position_ms(self) -> int:
+        return int(self._player.position()) if self._player is not None else 0
+
+    def duration_ms(self) -> int:
+        return int(self._player.duration()) if self._player is not None else 0
+
+    def seek_to(self, ms: int) -> None:
+        self._seek(max(0, int(ms)))
+        self._on_position(max(0, int(ms)))
+
+    def set_marks(self, start_ms: int | None, end_ms: int | None) -> None:
+        self._slider.set_marks(start_ms, end_ms)
+
+    def play_range(self, start_ms: int, end_ms: int) -> None:
+        """Проиграть кусок и встать на паузу в его конце."""
+        if self._player is None or self._kind not in ("video", "audio"):
+            return
+        self._stop_at = int(end_ms)
+        self._seek(int(start_ms))
+        if not (self._want_play or self._is_playing()):
+            self.toggle_play()
+
+    def _sync_audio(self) -> None:
+        """Видео и отдельный звук играют вместе.
+
+        Звук — главные часы: во время игры его не перематываем (иначе он на
+        миг пропадает), а видео догоняет его чуть быстрее/медленнее.
+        Старт и продолжение после перемотки: сначала звук (ему нужно время,
+        чтобы зазвучать), видео уже стоит на нужном кадре и трогается, как
+        только звук пошёл. Если одна дорожка ждёт данные — вторая на паузе.
+        BufferingMedia — это «играет, буфер неполный», ждать из-за него не нужно.
+        """
+        audio, video = self._aplayer, self._player
+        if audio is None or video is None or audio.source().isEmpty():
+            return
+        S = QMediaPlayer.MediaStatus
+        playing = QMediaPlayer.PlaybackState.PlayingState
+        waiting = (S.StalledMedia, S.LoadingMedia)
+        if not self._want_play:
+            self._av_start = None
+            if audio.playbackState() == playing:
+                audio.pause()
+            if video.playbackRate() != 1.0:
+                video.setPlaybackRate(1.0)
+            return
+        if video.mediaStatus() == S.EndOfMedia:
+            return
+        if audio.mediaStatus() == S.EndOfMedia:      # звук короче видео — пусть видео доиграет
+            if video.playbackState() != playing:
+                video.play()
+            return
+        video_waits = video.mediaStatus() in waiting
+        audio_waits = audio.mediaStatus() in waiting
+        if video_waits or audio_waits:
+            self._av_start = None
+            if not video_waits and video.playbackState() == playing:
+                video.pause()
+            if not audio_waits and audio.playbackState() == playing:
+                audio.pause()
+            return
+        if audio.playbackState() != playing:
+            # Старт: видео ждёт на месте, звук запускаем с позиции видео —
+            # но только когда видео уже показало кадр на этом месте (после
+            # перемотки ему нужно время), иначе звук убежит вперёд.
+            if video.playbackState() == playing:
+                video.pause()
+            if not self._av_frame and time.monotonic() - self._av_wait_since < AV_START_TIMEOUT_S:
+                return
+            if abs(audio.position() - video.position()) > AV_DRIFT_MS:
+                audio.setPosition(video.position())
+            audio.play()
+            self._av_start = (audio.position(), time.monotonic())
+            return
+        if self._av_start is not None:
+            first, since = self._av_start
+            if audio.position() == first and time.monotonic() - since < AV_START_TIMEOUT_S:
+                if video.playbackState() == playing:
+                    video.pause()
+                return                               # звук ещё не зазвучал
+            self._av_start = None
+            video.setPlaybackRate(1.0)
+            video.play()
+            return
+        if video.playbackState() != playing:
+            video.play()
+        drift = video.position() - audio.position()  # > 0 — видео впереди
+        rate = 1.0
+        if abs(drift) > AV_JUMP_MS:
+            video.setPosition(audio.position())
+        elif abs(drift) > AV_DRIFT_MS:
+            rate = 1.0 - max(-AV_MAX_RATE_SHIFT, min(AV_MAX_RATE_SHIFT, drift / 2000.0))
+        if abs(video.playbackRate() - rate) > 0.005:
+            video.setPlaybackRate(rate)
 
     # ------------------------------------------------------------------
     # Буферизация
@@ -487,6 +681,7 @@ class PreviewPlayer(QWidget):
         self._sync_play_button()
 
     def _on_frame(self, _frame) -> None:
+        self._av_frame = True                # видео показало кадр — может трогаться
         if not self._first_frame:
             self._first_frame = True
             self._check_buffer()  # кадр показан — теперь можно копить запас
@@ -505,6 +700,9 @@ class PreviewPlayer(QWidget):
         self._update_time(self._player.position() if self._player else 0)
 
     def _on_position(self, position: int) -> None:
+        if self._stop_at is not None and position >= self._stop_at:
+            self._stop_at = None
+            self.pause()
         if not self._slider.isSliderDown():
             self._slider.setValue(position)
             self._update_time(position)
@@ -522,6 +720,12 @@ class PreviewPlayer(QWidget):
         # На паузе (и во время буферизации) плеер сам покажет кадр в новом
         # месте, как только придут данные; буферизация продолжится оттуда.
         self._player.setPosition(int(value))
+        if self._aplayer is not None and not self._aplayer.source().isEmpty():
+            self._aplayer.pause()            # дальше — заново «старт» в _sync_audio
+            self._aplayer.setPosition(int(value))
+            self._av_start = None
+            self._av_frame = False
+            self._av_wait_since = time.monotonic()
 
     def _on_media_status(self, status) -> None:
         S = QMediaPlayer.MediaStatus
@@ -595,16 +799,18 @@ class PreviewPlayer(QWidget):
         self._sync_mute_button()
 
     def _sync_mute_button(self) -> None:
+        from ..ui import theme as _theme
+
         muted = self._audio is None or self._audio.isMuted() or self._volume.value() == 0
-        icon = QStyle.StandardPixmap.SP_MediaVolumeMuted if muted else QStyle.StandardPixmap.SP_MediaVolume
-        self._btn_mute.setIcon(self.style().standardIcon(icon))
+        self._btn_mute.setIcon(_theme.icon("mute" if muted else "volume", None, 20))
 
     def _sync_play_button(self, *_args) -> None:
         # Во время буферизации видео «как бы играет» — показываем паузу,
         # чтобы было понятно: оно продолжит само.
-        playing = self._is_playing() or (self._buffering and self._want_play)
-        icon = QStyle.StandardPixmap.SP_MediaPause if playing else QStyle.StandardPixmap.SP_MediaPlay
-        self._btn_play.setIcon(self.style().standardIcon(icon))
+        from ..ui import theme as _theme
+
+        playing = self._is_playing() or ((self._buffering or self._av_timer.isActive()) and self._want_play)
+        self._btn_play.setIcon(_theme.icon("pause" if playing else "play", _theme.current().pri_text, 18))
 
     # ------------------------------------------------------------------
     def _show_page(self, page: QWidget | None) -> None:
@@ -623,7 +829,8 @@ class PreviewPlayer(QWidget):
         if key == Qt.Key.Key_Space:
             self.toggle_play()
         elif key in (Qt.Key.Key_Left, Qt.Key.Key_Right) and self._player is not None:
-            step = SEEK_STEP_MS if key == Qt.Key.Key_Right else -SEEK_STEP_MS
+            size = FINE_STEP_MS if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else SEEK_STEP_MS
+            step = size if key == Qt.Key.Key_Right else -size
             target = max(0, min(self._player.duration(), self._player.position() + step))
             self._seek(target)
         else:

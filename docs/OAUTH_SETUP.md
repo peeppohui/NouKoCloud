@@ -26,7 +26,7 @@
    * Тип приложения выбирается один раз и потом не меняется — это нормально:
    нашему приложению нужно обращаться к API Диска, а не к профилю Яндекс ID.
 3. Заполните:
-   * **Название сервиса** — `svsCloud`;
+   * **Название сервиса** — `НоуКо Cloud`;
    * **Контактный email** — реальный почтовый ящик (на него придут
      уведомления о проверке приложения);
    * **Права доступа** — включите **«Чтение всех файлов Яндекс.Диска»**
@@ -69,7 +69,7 @@
 ### 2.1. Создать проект
 
 1. Откройте <https://console.cloud.google.com/>.
-2. Создайте проект (например `svsCloud`).
+2. Создайте проект (например `НоуКо Cloud`).
 3. **APIs & Services → Library** → найдите **Google Drive API** → **Enable**.
 
 ### 2.2. Создать OAuth-клиент
@@ -119,15 +119,15 @@
 `config.json` с ключами или задайте переменные окружения:
 
 ```powershell
-setx SVSCLOUD_YANDEX_CLIENT_ID     "1234567890"
-setx SVSCLOUD_YANDEX_CLIENT_SECRET "abcdef"
-setx SVSCLOUD_GOOGLE_CLIENT_ID     "1234-abc.apps.googleusercontent.com"
-setx SVSCLOUD_GOOGLE_CLIENT_SECRET "GOCSPX-..."
-setx SVSCLOUD_GOOGLE_API_KEY       "AIza..."
+setx NOUKOCLOUD_YANDEX_CLIENT_ID     "1234567890"
+setx NOUKOCLOUD_YANDEX_CLIENT_SECRET "abcdef"
+setx NOUKOCLOUD_GOOGLE_CLIENT_ID     "1234-abc.apps.googleusercontent.com"
+setx NOUKOCLOUD_GOOGLE_CLIENT_SECRET "GOCSPX-..."
+setx NOUKOCLOUD_GOOGLE_API_KEY       "AIza..."
 ```
 
 Программа читает переменные окружения при старте и подставляет их в
-настройки. Файл настроек: `%APPDATA%\svsCloud\config.json`.
+настройки. Файл настроек: `%APPDATA%\NoukoCloud\config.json`.
 
 ---
 

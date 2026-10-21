@@ -59,6 +59,26 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+class NoRangeHandler(http.server.BaseHTTPRequestHandler):
+    """Облако, которое не отдаёт файл по частям (500 на Range), а целиком — отдаёт."""
+
+    payload = b""
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):  # noqa: N802
+        if self.headers.get("Range"):
+            self.send_response(500)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(self.payload)))
+        self.end_headers()
+        self.wfile.write(self.payload)
+
+
 async def read_http(port: int, path: str, headers: dict[str, str] | None = None,
                     method: str = "GET") -> tuple[int, dict, bytes]:
     reader, writer = await asyncio.open_connection("127.0.0.1", port)
@@ -175,6 +195,64 @@ class TestPreviewServer(unittest.IsolatedAsyncioTestCase):
         status, _headers, _body = await read_http(self.server.port, self._new_session("gone"))
         self.assertEqual(status, 502)
         self.assertLess(asyncio.get_running_loop().time() - started, 5, "отказ облака — без долгих повторов")
+
+    async def test_storage_node_error_gets_new_link(self) -> None:
+        """Узел хранилища Яндекса отвечает 500 — берём новую ссылку (другой узел), а не
+        долбим тот же адрес: раньше шесть повторов шли в один сломанный узел."""
+        self.provider.urls = [self._status_server(500), self.good_url]
+        self.provider.resolved = 0
+        status, _headers, body = await read_http(self.server.port, self._new_session("node500"))
+        self.assertEqual(status, 200)
+        self.assertEqual(body, PAYLOAD)
+        self.assertEqual(self.provider.resolved, 2)
+        self.assertEqual(self.provider.forgotten, 1)
+
+    async def test_file_without_range_support_still_previews(self) -> None:
+        """Яндекс отвечает 500 на любой запрос части файла, а целиком отдаёт —
+        превью читает файл по порядку («МИР ТРЕЙДИНГА рилс.mp4», 21.10.2026)."""
+        NoRangeHandler.payload = PAYLOAD
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), NoRangeHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.provider.urls = [f"http://127.0.0.1:{server.server_address[1]}/f"]
+        self.provider.resolved = 0
+        path = self._new_session("norange")
+        status, _headers, body = await read_http(self.server.port, path, {"Range": "bytes=150000-"})
+        self.assertEqual(status, 206)
+        self.assertEqual(body, PAYLOAD[150000:])
+
+    async def test_warm_prefetches_only_a_little_then_serves_instantly(self) -> None:
+        """Предзагрузка соседа: ссылка и начало файла готовы заранее, но качаем
+        немного; открыли файл — берём тот же кэш и качаем уже с запасом."""
+        from app.preview import stream_cache
+
+        big = CloudFile(provider=ProviderId.YANDEX, file_id="warm", path="/video/warm.mp4",
+                        name="warm.mp4", kind=EntryKind.FILE, size=len(PAYLOAD), mime="video/mp4")
+        original = stream_cache.WARM_AHEAD, stream_cache.CHUNK
+        stream_cache.CHUNK = 16 * 1024                    # файл — 13 кусков
+        stream_cache.WARM_AHEAD = stream_cache.CHUNK      # «немного» = один кусок
+        try:
+            self.server.warm([big])
+            for _ in range(100):
+                await asyncio.sleep(0.02)
+                entry = self.server._caches.get(self.server._file_key(big))
+                if entry is not None and entry[0]._index[0] >= 0:
+                    break
+            cache = self.server._caches[self.server._file_key(big)][0]
+            await asyncio.sleep(0.3)
+            have = sum(1 for o in cache._index if o >= 0)
+            self.assertGreaterEqual(have, 1)
+            self.assertLess(have, cache.count, "предзагрузка не качает весь файл")
+            resolved = self.provider.resolved
+            session = self.server.add_session(big)
+            status, _headers, body = await read_http(self.server.port, f"/media/{session.token}")
+            self.assertEqual(status, 200)
+            self.assertEqual(body, PAYLOAD)
+            self.assertIs(session.cache, cache, "тот же кэш, что готовили заранее")
+            self.assertEqual(self.provider.resolved, resolved, "ссылку заново не просили")
+        finally:
+            stream_cache.WARM_AHEAD, stream_cache.CHUNK = original
 
     async def test_server_error_is_retried_then_reported(self) -> None:
         from app.preview import stream_cache

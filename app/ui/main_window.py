@@ -6,19 +6,19 @@ import logging
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
+    QApplication,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QMainWindow,
     QPushButton,
     QSplitter,
-    QTabWidget,
-    QToolBar,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -26,15 +26,25 @@ from PySide6.QtWidgets import (
 from ..context import AppContext
 from ..core.errors import friendly_error
 from ..core.models import CloudFile, ProviderId, SourceKind
+from ..downloader.engine import _safe_name
+from ..core.logging_setup import errors_log_path
 from ..core.paths import logs_dir
 from ..providers.base import BrowseContext
 from ..preview.stream_cache import cache_usage, clear_directory
 from .auth_dialog import AuthDialog
-from .file_tree import FileTree
+from .file_tree import LOADED_ROLE, FileTree
 from .preview_panel import PreviewPanel
 from .queue_view import QueueView
+from . import theme
+from . import sound
+from .frameless import FramelessWindow
+from .motion import install as install_motion
+from .motion import motion
 from .settings_dialog import SettingsDialog
-from .theme import STYLESHEET
+from .social_page import SocialPage
+from .start_page import StartPage
+from .tray import Tray
+from .widgets import Breakpoint, IconLabel, SegmentedTabs, StarsBackground, TitleBar, button, glass, label
 
 
 def _human_size(size: int) -> str:
@@ -46,6 +56,9 @@ def _human_size(size: int) -> str:
     return f"{value:.1f} ТБ"
 
 log = logging.getLogger(__name__)
+
+# Содержимое папки, загруженное заранее, годно столько секунд.
+PREFETCH_TTL = 60.0
 
 # Картинки скачиваются для превью целиком — огромные TIFF не тянем.
 IMAGE_PREVIEW_LIMIT = 200 * 1024 * 1024
@@ -106,10 +119,11 @@ class _PreviewCacheOps:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
 
-class MainWindow(QMainWindow):
+class MainWindow(FramelessWindow, QMainWindow):
     def __init__(self, ctx: AppContext) -> None:
         super().__init__()
         self.ctx = ctx
+        self._last_url = ""                      # ссылка, которую открываем сейчас
         self._preview_token: str | None = None
         self._preview_key: tuple | None = None   # какой файл сейчас в превью
         self._proxy_tried: set[str] = set()      # токены, для которых уже делали копию ffmpeg
@@ -118,37 +132,94 @@ class MainWindow(QMainWindow):
         self._pending_preview: CloudFile | None = None
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
-        self._preview_timer.setInterval(350)
+        self._preview_timer.setInterval(150)
+        # Предзагрузка файла под мышью — если мышь задержалась, а не пролетела.
+        self._hover_file: CloudFile | None = None
+        self._hover_timer = QTimer(self)
+        self._hover_timer.setSingleShot(True)
+        self._hover_timer.setInterval(200)
+        self._hover_timer.timeout.connect(self._warm_hovered)
+        # Содержимое папок, загруженное заранее (мышь задержалась над папкой):
+        # ключ -> (время, future). Раскрыли папку — берём готовое.
+        self._prefetched: dict[tuple, tuple[float, object]] = {}
+        self._hover_folder: tuple | None = None
         self._preview_timer.timeout.connect(self._preview_pending)
         self._invoker = _GuiInvoker(self)
-        self.setWindowTitle("svsCloud — облачные исходники для монтажа")
+        self.setWindowTitle("НоуКо Cloud — облачные исходники для монтажа")
+        self.setWindowIcon(theme.app_icon())
         self.resize(1280, 820)
-        self.setStyleSheet(STYLESHEET)
+        self.setMinimumSize(720, 520)
+        self.init_frameless()
+        motion().set_enabled(bool(ctx.config.ui_motion))
+        theme.manager().motion = bool(ctx.config.ui_motion)
+        theme.manager().set_theme(ctx.config.ui_theme)
+        sound.bank().enabled = bool(ctx.config.ui_sounds)
+        sound.bank().set_volume(int(getattr(ctx.config, "ui_volume", 60)))
+        app = QApplication.instance()
+        if app is not None:
+            install_motion(app)
 
         self._build_ui()
         self._connect_bus()
+        self._quitting = False
+        self.tray: Tray | None = None
+        self._setup_background()
         self._on_checked_changed(0)
 
         QTimer.singleShot(0, self._after_start)
 
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
-        central = QWidget(self)
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(12, 12, 12, 8)
-        layout.setSpacing(10)
+        root = QWidget(self)
+        root.setObjectName("windowRoot")
+        root.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal, central)
+        self.title_bar = TitleBar(root)
+        self._title_bar = self.title_bar        # для окна без рамки (frameless.py)
+        self.title_bar.open_link.connect(self._open_url)
+        self.title_bar.my_drive.connect(self._open_my_drive)
+        self.title_bar.social.connect(self.show_social)
+        self.title_bar.accounts.connect(self._open_accounts)
+        self.title_bar.settings.connect(self._open_settings)
+        self.title_bar.toggle_theme.connect(self._toggle_theme)
+        self.title_bar.home.connect(self.show_start)
+        layout.addWidget(self.title_bar)
 
-        left = QWidget(splitter)
+        self.pages = QStackedWidget(root)
+        layout.addWidget(self.pages, 1)
+
+        # --- Стартовый экран ---
+        self.start_page = StartPage(self.pages)
+        self.start_page.open_link.connect(self._open_url)
+        self.start_page.my_drive.connect(self._open_my_drive)
+        self.start_page.social.connect(self.show_social)
+        self.start_page.accounts.connect(self._open_accounts)
+        self.start_page.forget_link.connect(self._forget_link)
+        self.start_page.set_recent(self.ctx.config.recent_links)
+        self.pages.addWidget(self.start_page)
+
+        # --- Рабочий экран: файлы слева, превью и очередь справа ---
+        workspace = StarsBackground(self.pages)
+        work = QHBoxLayout(workspace)
+        work.setContentsMargins(16, 16, 16, 16)
+        splitter = QSplitter(Qt.Orientation.Horizontal, workspace)
+        splitter.setHandleWidth(16)
+        splitter.setChildrenCollapsible(False)
+
+        left = glass(splitter)
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(8)
+        left_layout.setSpacing(0)
         self.tree = FileTree(left)
         self.tree._loader = self._load_children
         self.tree.children_loaded.connect(self.tree.handle_children_loaded)
         self.tree.file_activated.connect(self._activate_preview)
         self.tree.file_selected.connect(self._on_file_selected)
+        self.tree.file_hovered.connect(self._on_file_hovered)
+        self.tree.folder_hovered.connect(self._on_folder_hovered)
         self.tree.open_drive_requested.connect(self._open_my_drive_for)
         self.tree.checked_changed.connect(self._on_checked_changed)
         left_layout.addWidget(self.tree, 1)
@@ -156,68 +227,88 @@ class MainWindow(QMainWindow):
         # Кнопка массового скачивания живёт РЯДОМ с деревом: так её
         # невозможно перепутать с кнопкой «Скачать этот файл» в превью,
         # а в подписи видно, сколько файлов уедет в очередь.
-        action_row = QHBoxLayout()
-        action_row.setSpacing(8)
-        self._btn_download = QPushButton("Скачать выбранное", left)
-        self._btn_download.setProperty("accent", True)
+        action_bar = QWidget(left)
+        action_bar.setObjectName("footerBar")
+        action_bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        action_row = QHBoxLayout(action_bar)
+        action_row.setContentsMargins(20, 16, 20, 16)
+        action_row.setSpacing(16)
+        self._btn_download = button("Скачать выбранное", "primary", action_bar, icon_name="download")
         self._btn_download.setEnabled(False)
         self._btn_download.clicked.connect(self._download_selected)
         action_row.addWidget(self._btn_download)
-        self._selection_label = QLabel("Отмечено: 0", left)
-        self._selection_label.setProperty("muted", True)
+        self._selection_label = label("Отмечено: 0", "muted", action_bar)
         action_row.addWidget(self._selection_label)
         action_row.addStretch(1)
-        left_layout.addLayout(action_row)
-
+        left_layout.addWidget(action_bar)
         splitter.addWidget(left)
 
-        self.tabs = QTabWidget(splitter)
+        right = QWidget(splitter)
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(12)
+        self._seg = SegmentedTabs(["Превью", "Очередь"], right)
+        self._queue_badge = self._seg.add_badge(1)
+        self._queue_badge.setVisible(False)
+        self._seg.refresh_badge(1)
+        right_layout.addWidget(self._seg, 0, Qt.AlignmentFlag.AlignLeft)
+
+        # tabs — стопка «Превью / Очередь» (API как у QTabWidget: currentWidget,
+        # setCurrentIndex, currentChanged).
+        self.tabs = QStackedWidget(right)
         self.preview_panel = PreviewPanel(self.tabs)
+        self._make_glass(self.preview_panel)
         self.preview_panel.download_requested.connect(self._download_one)
         self.preview_panel.player.failed.connect(self._on_preview_failed)
-        self.tabs.addTab(self.preview_panel, "Превью")
+        self.tabs.addWidget(self.preview_panel)
         self.queue_view = QueueView(self.tabs)
+        self._make_glass(self.queue_view)
         self.queue_view.pause_requested.connect(self._engine_call(self.ctx.engine.pause))
         self.queue_view.resume_requested.connect(self._engine_call(self.ctx.engine.resume))
         self.queue_view.cancel_requested.connect(self._engine_call(self.ctx.engine.cancel))
         self.queue_view.remove_requested.connect(self._engine_call(self.ctx.engine.remove))
         self.queue_view.open_folder_requested.connect(self._open_download_dir)
-        self.tabs.addTab(self.queue_view, "Очередь")
+        self.tabs.addWidget(self.queue_view)
         self.tabs.currentChanged.connect(self._on_tab_changed)
-        splitter.addWidget(self.tabs)
-        splitter.setStretchFactor(0, 4)
-        splitter.setStretchFactor(1, 3)
-        splitter.setSizes([560, 680])
+        self.tabs.currentChanged.connect(self._seg.set_current)
+        self._seg.changed.connect(self.tabs.setCurrentIndex)
+        right_layout.addWidget(self.tabs, 1)
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 5)
+        splitter.setStretchFactor(1, 4)
+        # Узкое и высокое окно (половина экрана): список сверху, превью снизу.
+        # Узкое и низкое — оставляем рядом: столбцом обоим не хватит высоты.
+        self._work_bp = Breakpoint(workspace, lambda w, h: w < 900 and h >= 640,
+                                   lambda narrow: splitter.setOrientation(
+                                       Qt.Orientation.Vertical if narrow else Qt.Orientation.Horizontal))
+        splitter.setSizes([700, 560])
+        work.addWidget(splitter)
+        self.pages.addWidget(workspace)
+        self._workspace = workspace
 
-        layout.addWidget(splitter, 1)
-        self.setCentralWidget(central)
+        # --- Соцсети: видео и звук по ссылке ---
+        self.social_page = SocialPage(lambda: self.ctx.config.download_dir_path, self.pages)
+        self.social_page.notice.connect(self._on_notice)
+        self.social_page.notice.connect(self._notify_hidden)
+        self.pages.addWidget(self.social_page)
 
-        self._build_toolbar()
-        self._build_statusbar()
+        self._build_actions()
+        self._build_statusbar(layout, root)
+        self.setCentralWidget(root)
+        self.show_start()
 
-    def _build_toolbar(self) -> None:
-        bar = QToolBar("Основное", self)
-        bar.setMovable(False)
-        self.addToolBar(bar)
+    @staticmethod
+    def _make_glass(widget: QWidget) -> None:
+        widget.setProperty("glass", True)
+        widget.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
 
-        self._act_accounts = QAction("Аккаунты", self)
-        self._act_accounts.triggered.connect(self._open_accounts)
-        bar.addAction(self._act_accounts)
-
+    def _build_actions(self) -> None:
         self._act_link = QAction("Открыть ссылку", self)
         self._act_link.setShortcut(QKeySequence("Ctrl+O"))
         self._act_link.triggered.connect(self._open_link)
-        bar.addAction(self._act_link)
+        self.addAction(self._act_link)
 
-        self._act_mydrive = QAction("Мой диск", self)
-        self._act_mydrive.triggered.connect(self._open_my_drive)
-        bar.addAction(self._act_mydrive)
-
-        spacer = QWidget(bar)
-        spacer.setSizePolicy(spacer.sizePolicy().horizontalPolicy().Expanding, spacer.sizePolicy().verticalPolicy())
-        bar.addWidget(spacer)
-
-        # Действие «скачать выбранное» без кнопки в тулбаре: сама кнопка
+        # Действие «скачать выбранное» без кнопки в шапке: сама кнопка
         # живёт под деревом, где видно отметки.
         self._act_download = QAction("Скачать выбранное", self)
         self._act_download.setShortcut(QKeySequence("Ctrl+D"))
@@ -225,16 +316,88 @@ class MainWindow(QMainWindow):
         self._act_download.setEnabled(False)
         self.addAction(self._act_download)
 
-        self._act_settings = QAction("Настройки", self)
-        self._act_settings.triggered.connect(self._open_settings)
-        bar.addAction(self._act_settings)
+    def _build_statusbar(self, layout: QVBoxLayout, parent: QWidget) -> None:
+        bar = QWidget(parent)
+        bar.setObjectName("footerBar")
+        bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(20, 6, 12, 6)
+        row.setSpacing(16)
+        self._status_label = QLabel("Готово", bar)
+        self._status_label.setMinimumWidth(100)
+        row.addWidget(self._status_label, 1)
+        self._activity_icon = IconLabel("target", "text", 12, bar, stroke=2.4)
+        self._activity_icon.setVisible(False)
+        row.addWidget(self._activity_icon)
+        self._activity = QLabel("", bar)
+        row.addWidget(self._activity)
+        log_btn = button("Журнал", "ghost", bar, icon_name="log", size="s")
+        log_btn.setToolTip("Открыть папку журналов: errors.log — ошибки с подробностями, "
+                           "noukocloud.log — всё, что делала программа")
+        log_btn.clicked.connect(self._open_logs)
+        row.addWidget(log_btn)
+        layout.addWidget(bar)
 
-    def _build_statusbar(self) -> None:
-        self._status_label = QLabel("Готово", self)
-        self.statusBar().addWidget(self._status_label, 1)
-        action = QAction("Журнал", self)
-        action.triggered.connect(self._open_logs)
-        self.statusBar().addAction(action)
+    # --- экраны -----------------------------------------------------------
+    def show_start(self) -> None:
+        self.start_page.set_recent(self.ctx.config.recent_links)
+        self.pages.setCurrentWidget(self.start_page)
+        self.title_bar.set_field_visible(False)
+        self.title_bar.set_active(None)
+
+    def show_workspace(self) -> None:
+        self.pages.setCurrentWidget(self._workspace)
+        self.title_bar.set_field_visible(True)
+        if self.title_bar.active() == "social":
+            self.title_bar.set_active(None)
+
+    def show_social(self) -> None:
+        self.pages.setCurrentWidget(self.social_page)
+        self.title_bar.set_field_visible(False)
+        self.title_bar.set_active("social")
+        self.social_page.link_edit.setFocus()
+
+    def _forget_link(self, url: str) -> None:
+        self.ctx.config.forget_link(url)
+        self._save_config()
+        self.start_page.set_recent(self.ctx.config.recent_links)
+
+    def _save_config(self) -> None:
+        try:
+            self.ctx.config.save()
+        except Exception:
+            log.warning("Не удалось сохранить настройки", exc_info=True)
+
+    def _apply_ui_prefs(self) -> None:
+        """Анимации и звуки из «Настроек» — сразу, без перезапуска."""
+        cfg = self.ctx.config
+        sound.bank().enabled = bool(cfg.ui_sounds)
+        sound.bank().set_volume(int(cfg.ui_volume))
+        if theme.manager().motion != bool(cfg.ui_motion):
+            theme.manager().motion = bool(cfg.ui_motion)
+            motion().set_enabled(bool(cfg.ui_motion))
+            theme.manager().set_theme(cfg.ui_theme)
+
+    def _toggle_theme(self) -> None:
+        sound.play("toggle")
+        self.ctx.config.ui_theme = theme.manager().toggle()
+        self._save_config()
+
+    # --- окно без рамки ---------------------------------------------------
+    def showEvent(self, event) -> None:  # noqa: N802
+        self._apply_native_styles()
+        super().showEvent(event)
+
+    def nativeEvent(self, event_type, message):  # noqa: N802
+        result = self.frameless_native_event(event_type, message)
+        if result is not None:
+            return result
+        return super().nativeEvent(event_type, message)
+
+    def changeEvent(self, event) -> None:  # noqa: N802
+        if event.type() == QEvent.Type.WindowStateChange:
+            self.title_bar.sync_max_button(self.isMaximized())
+        super().changeEvent(event)
 
     # ------------------------------------------------------------------
     def _in_gui(self, handler):
@@ -287,17 +450,22 @@ class MainWindow(QMainWindow):
         try:
             restored = future.result()
         except Exception as exc:
-            log.warning("Не удалось восстановить загрузки: %s", exc)
+            log.warning("Не удалось восстановить загрузки: %s", exc, exc_info=True)
             return
         if restored:
             self._on_notice(
                 "info",
                 f"Найдено незаконченных загрузок: {len(restored)}. Продолжаем с места обрыва.",
             )
+            self.show_workspace()
             self.tabs.setCurrentIndex(1)
 
     # ------------------------------------------------------------------
     def _on_notice(self, level: str, text: str) -> None:
+        if level == "error":
+            # Что увидел пользователь — в журнал ошибок (подробности — строкой выше).
+            log.error("Показано пользователю: %s", text)
+            sound.play("error")
         self._status_label.setText(text)
         if level == "error":
             self._status_label.setProperty("error", True)
@@ -307,18 +475,56 @@ class MainWindow(QMainWindow):
         self._status_label.style().polish(self._status_label)
 
     def _on_snapshot(self, jobs) -> None:
-        self.queue_view.sync(list(jobs))
+        jobs = list(jobs)
+        self.queue_view.sync(jobs)
         total, done, active = self.ctx.engine.stats()
         self.queue_view.set_summary(total, done, active)
+        waiting = sum(1 for j in jobs if j.state.name in ("QUEUED", "RUNNING", "PAUSED"))
+        self._queue_badge.setText(str(waiting))
+        self._queue_badge.setVisible(waiting > 0)
+        self._seg.refresh_badge(1)
+        self._update_activity()
 
     def _on_progress(self, job) -> None:
         self.queue_view.update_job(job)
+        self._update_activity()
+
+    def _update_activity(self) -> None:
+        """Справа внизу: «качается 2 · 18.4 МБ/с»."""
+        try:
+            jobs = self.ctx.engine.snapshot()
+        except Exception:
+            return
+        running = [j for j in jobs if j.state.name == "RUNNING"]
+        social = self.social_page.active_count()
+        if self.tray is not None:
+            parts = []
+            if running:
+                parts.append(f"облако: {len(running)}")
+            if social:
+                parts.append(f"соцсети: {social}")
+            self.tray.set_activity("качается " + ", ".join(parts) if parts else "")
+        if not running:
+            self._activity.setText("")
+            self._activity_icon.setVisible(False)
+            return
+        speed = sum(j.speed_bps for j in running)
+        text = f"качается {len(running)}"
+        if speed > 0:
+            text += f" · {_human_size(int(speed))}/с"
+        self._activity.setText(text)
+        self._activity_icon.setVisible(True)
 
     def _on_finished(self, job) -> None:
         if job.state.name == "DONE":
             self._on_notice("info", f"Готово: {job.file.name}")
+            # «Готово» звучит один раз — когда скачана вся очередь, а не на каждый файл.
+            if not any(j.state.name in ("QUEUED", "RUNNING") for j in self.ctx.engine.snapshot()):
+                sound.play("success")
+                self._notify_hidden("info", "Все загрузки из облака готовы")
         elif job.state.name == "FAILED":
             self._on_notice("error", f"Файл не скачан: {job.error}")
+            self._notify_hidden("error", f"Не скачан {job.file.name}: {job.error}")
         self._on_snapshot(self.ctx.engine.snapshot())
 
     def _on_logged_in(self, pid: str, name: str) -> None:
@@ -330,17 +536,48 @@ class MainWindow(QMainWindow):
         self._open_my_drive_for(provider, interactive=False)
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _folder_key(file: CloudFile, ctx: BrowseContext) -> tuple:
+        return (file.provider.value, file.source.value, ctx.public_key, file.file_id, file.path)
+
     def _load_children(self, file: CloudFile, ctx: BrowseContext, done) -> None:
-        """Асинхронная загрузка содержимого папки."""
+        """Асинхронная загрузка содержимого папки (или готовое — из предзагрузки)."""
+        cached = self._prefetched.pop(self._folder_key(file, ctx), None)
+        if cached is not None and time.monotonic() - cached[0] < PREFETCH_TTL:
+            future = cached[1]
+        else:
+            provider = self.ctx.registry.get(file.provider)
+            future = self.ctx.runtime.submit(provider.list_children(ctx, file))
+        future.add_done_callback(self._in_gui(lambda fut: self._deliver(fut, done, file.provider.value)))
+
+    def _on_folder_hovered(self, file: CloudFile, ctx: BrowseContext) -> None:
+        self._hover_folder = (file, ctx)
+        self._hover_file = None
+        self._hover_timer.start()
+
+    def _prefetch_folder(self, file: CloudFile, ctx: BrowseContext) -> None:
+        key = self._folder_key(file, ctx)
+        old = self._prefetched.get(key)
+        if old is not None and time.monotonic() - old[0] < PREFETCH_TTL:
+            return
+        # Старые и лишние предзагрузки забываем (память и свежесть списка).
+        now = time.monotonic()
+        for k in [k for k, (ts, _f) in self._prefetched.items() if now - ts >= PREFETCH_TTL]:
+            del self._prefetched[k]
+        while len(self._prefetched) >= 16:
+            self._prefetched.pop(next(iter(self._prefetched)))
         provider = self.ctx.registry.get(file.provider)
         future = self.ctx.runtime.submit(provider.list_children(ctx, file))
-        future.add_done_callback(self._in_gui(lambda fut: self._deliver(fut, done, file.provider.value)))
+        # Ошибку предзагрузки не показываем: при раскрытии папку спросят заново.
+        future.add_done_callback(self._in_gui(
+            lambda fut: (fut.cancelled() or fut.exception() is not None) and self._prefetched.pop(key, None)))
+        self._prefetched[key] = (now, future)
 
     def _deliver(self, future, done, provider: str) -> None:
         try:
             files = future.result()
         except Exception as exc:
-            log.warning("Не удалось загрузить папку: %s", exc)
+            log.warning("Не удалось загрузить папку: %s", exc, exc_info=True)
             self._on_notice("error", friendly_error(exc, provider=provider))
             done(None)   # None — ошибка: дерево даст раскрыть папку повторно
         else:
@@ -348,34 +585,47 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------
     def _open_accounts(self) -> None:
+        self.title_bar.set_active("accounts")
         dialog = AuthDialog(self.ctx.oauth, self.ctx.runtime, self)
         dialog.login_succeeded.connect(lambda pid, name: self._on_notice("info", f"Вход выполнен: {name}"))
         dialog.login_failed.connect(lambda pid, msg: self._on_notice("error", msg))
         dialog.exec()
+        self._restore_nav()
 
     def _open_settings(self) -> None:
+        self.title_bar.set_active("settings")
         dialog = SettingsDialog(self.ctx.config, self, cache_ops=_PreviewCacheOps(self))
         if dialog.exec() == SettingsDialog.DialogCode.Accepted:
             self.ctx.oauth.reload_config()
+            self._apply_ui_prefs()
+            self._sync_close_tooltip()
             self._on_notice("info", "Настройки сохранены")
+        self._restore_nav()
+
+    def _restore_nav(self) -> None:
+        self.title_bar.set_active("social" if self.pages.currentWidget() is self.social_page else None)
 
     def open_link_at_startup(self, url: str) -> None:
         """Открывает ссылку сразу после запуска (ключ --open)."""
         QTimer.singleShot(1500, lambda: self._open_url(url))
 
     def _open_link(self) -> None:
-        url, ok = QInputDialog.getText(
-            self,
-            "Открыть ссылку",
-            "Вставьте ссылку на папку или файл:\n"
-            "(Яндекс.Диск, Google Диск)",
-        )
-        if not ok or not url.strip():
-            return
-        self._open_url(url.strip())
+        """Ctrl+O — курсор в поле ссылки."""
+        if self.pages.currentWidget() is self.start_page:
+            edit = self.start_page.link_edit
+        else:
+            edit = self.title_bar.link_edit
+        edit.setFocus()
+        edit.selectAll()
 
     def _open_url(self, url: str) -> None:
+        url = url.strip()
+        if not url:
+            return
         log.info("Открываем ссылку (как вставлена): %r", url)
+        self._last_url = url
+        self.title_bar.set_link(url)
+        self.show_workspace()
         self._on_notice("info", "Открываем ссылку…")
         future = self.ctx.runtime.submit(self.ctx.registry.open_link(url))
         future.add_done_callback(self._in_gui(self._after_open))
@@ -384,14 +634,20 @@ class MainWindow(QMainWindow):
         try:
             provider, ctx, items = future.result()
         except Exception as exc:
-            log.warning("Ссылка не открылась: %s", exc)
+            log.warning("Ссылка не открылась: %s", exc, exc_info=True)
             self._on_notice("error", friendly_error(exc))
             return
         title = ctx.display_name or provider.display_name
+        if self._last_url:
+            self.ctx.config.remember_link(self._last_url, f"{provider.display_name} · {title}")
+            self._save_config()
+            self.start_page.set_recent(self.ctx.config.recent_links)
+        self.tree.set_subtitle(f"{provider.display_name} · {title}")
         root = self.tree.add_root(title, ctx, provider.display_name, provider=provider.id)
         self.tree.set_children(root, items)
         self.tree.expand_item(root)
         if items:
+            sound.play("open")
             self._on_notice(
                 "info",
                 f"Открыто: {title}. Отметьте нужные файлы и нажмите «Скачать выбранное».",
@@ -400,12 +656,21 @@ class MainWindow(QMainWindow):
             self._on_notice("warn", f"«{title}» открыта, но внутри ничего нет.")
 
     def _open_my_drive(self) -> None:
-        choices = [("Яндекс.Диск", ProviderId.YANDEX), ("Google Диск", ProviderId.GOOGLE)]
-        names = [name for name, _ in choices]
-        name, ok = QInputDialog.getItem(self, "Мой диск", "Какой диск открыть?", names, 0, False)
-        if not ok:
-            return
-        self._open_my_drive_for(dict(choices)[name])
+        """«Мой диск»: рабочий экран и свои диски всех облаков, где выполнен вход."""
+        self.show_workspace()
+        logged = [pid for pid in (ProviderId.YANDEX, ProviderId.GOOGLE) if self.ctx.oauth.is_logged_in(pid)]
+        if not logged:
+            self._on_notice("warn", "Чтобы видеть «Мой диск», войдите в аккаунт.")
+            self._open_accounts()
+            logged = [pid for pid in (ProviderId.YANDEX, ProviderId.GOOGLE)
+                      if self.ctx.oauth.is_logged_in(pid)]
+        for pid in logged:
+            drive = self.tree.drive(pid)
+            if not drive.data(LOADED_ROLE):     # ещё не загружен и не грузится
+                self._open_my_drive_for(pid, interactive=False)
+            self.tree.expand_item(drive)
+        if logged:
+            self.tree.set_subtitle("Мой диск")
 
     def _open_my_drive_for(self, pid: ProviderId, interactive: bool = True) -> None:
         """Загружает «Мой диск» облака в его постоянный пункт дерева.
@@ -430,7 +695,7 @@ class MainWindow(QMainWindow):
         try:
             items = future.result()
         except Exception as exc:
-            log.warning("Не удалось открыть «Мой диск»: %s", exc)
+            log.warning("Не удалось открыть «Мой диск»: %s", exc, exc_info=True)
             self._on_notice("error", friendly_error(exc, provider=pid.value))
             self.tree.drive_failed(pid, "не загрузилось — сверните и раскройте снова")
             return
@@ -458,12 +723,33 @@ class MainWindow(QMainWindow):
             self._status_label.setText(f"Отмечено файлов: {count}")
 
     def _download_selected(self) -> None:
-        files = self.tree.checked_files()
-        log.info("Скачать выбранное: отмечено файлов — %d", len(files))
-        if not files:
+        if self.tree.loading():
+            # Содержимое отмеченных папок ещё приходит из облака — иначе часть
+            # файлов молча не попала бы в загрузку.
+            self._on_notice("warn", "Список файлов в папках ещё загружается — "
+                                    "нажмите «Скачать выбранное» через секунду.")
+            return
+        items = self.tree.checked_downloads()
+        log.info("Скачать выбранное: отмечено файлов — %d", len(items))
+        if not items:
             self._on_notice("warn", "Отметьте хотя бы один файл.")
             return
-        self._download_files(files)
+        # Отмеченная папка скачивается папкой (с вложенными), отдельные файлы —
+        # прямо в папку загрузок.
+        root = self.ctx.config.download_dir_path
+        groups: dict[tuple[str, ...], list[CloudFile]] = {}
+        for file, path in items:
+            groups.setdefault(path, []).append(file)
+
+        async def enqueue_all():
+            jobs = []
+            for path, files in groups.items():
+                dest = root.joinpath(*(_safe_name(part) for part in path)) if path else root
+                jobs += await self.ctx.engine.enqueue(files, dest)
+            return jobs
+
+        future = self.ctx.runtime.submit(enqueue_all())
+        future.add_done_callback(self._in_gui(self._after_enqueue))
 
     def _download_one(self, file: CloudFile) -> None:
         log.info("Скачать один файл: %s", file.name)
@@ -478,9 +764,12 @@ class MainWindow(QMainWindow):
         try:
             jobs = future.result()
         except Exception as exc:
-            log.warning("Не удалось поставить в очередь: %s", exc)
+            log.warning("Не удалось поставить в очередь: %s", exc, exc_info=True)
             self._on_notice("error", "Не удалось начать загрузку. Подробности в журнале.")
             return
+        if jobs:
+            sound.play("queue")
+        self.show_workspace()
         self.tabs.setCurrentIndex(1)
         self._on_notice("info", f"В очереди: {len(jobs)} файл(ов). Куда: {self.ctx.config.download_dir}")
     # ------------------------------------------------------------------
@@ -490,6 +779,21 @@ class MainWindow(QMainWindow):
             return
         self._pending_preview = file
         self._preview_timer.start()
+        # Соседей готовим заранее: следующий файл откроется без ожидания облака.
+        self.ctx.preview.warm(self.tree.neighbor_files())
+
+    def _on_file_hovered(self, file: CloudFile) -> None:
+        self._hover_file = file
+        self._hover_folder = None
+        self._hover_timer.start()
+
+    def _warm_hovered(self) -> None:
+        file, self._hover_file = self._hover_file, None
+        folder, self._hover_folder = self._hover_folder, None
+        if file is not None:
+            self.ctx.preview.warm([file])
+        if folder is not None:
+            self._prefetch_folder(*folder)
 
     def _on_tab_changed(self, _index: int) -> None:
         # Вернулись на «Превью», а курсор стоит на другом файле — показываем его.
@@ -548,6 +852,9 @@ class MainWindow(QMainWindow):
         """Плеер не открыл файл. Если дело в формате и есть ffmpeg — делаем облегчённую копию."""
         token = self._preview_token
         session = self.ctx.preview.get_session(token) if token else None
+        log.warning("Превью не открылось: %s (файл: %s, формат: %s)", message,
+                    session.file.name if session is not None else "?",
+                    "да" if format_problem else "нет")
         if session is None:
             return
         if (
@@ -614,14 +921,92 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
     def _open_logs(self) -> None:
-        path = str(logs_dir() / "svscloud.log")
+        # Сначала — журнал ошибок: там видно, где и почему что-то сломалось.
+        errors = errors_log_path()
+        path = str(errors if errors.exists() else logs_dir() / "noukocloud.log")
         if sys.platform == "win32":
             subprocess.Popen(["explorer", "/select,", path])
         else:
             QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Работа в фоне
+    # ------------------------------------------------------------------
+    def _setup_background(self) -> None:
+        if not Tray.available():
+            log.info("Системный трей недоступен — закрытие окна завершает программу")
+            return
+        self.tray = Tray(self)
+        self.tray.open_requested.connect(self.bring_to_front)
+        self.tray.downloads_requested.connect(self._open_download_dir)
+        self.tray.quit_requested.connect(self.quit_app)
+        self.tray.show()
+        self._sync_close_tooltip()
+        # Подсказка в трее обновляется и тогда, когда окно скрыто.
+        self._tray_timer = QTimer(self)
+        self._tray_timer.setInterval(2000)
+        self._tray_timer.timeout.connect(self._update_activity)
+        self._tray_timer.start()
+
+    def _sync_close_tooltip(self) -> None:
+        in_bg = self.tray is not None and bool(self.ctx.config.run_in_background)
+        self.title_bar.set_close_tooltip("Закрыть окно (программа останется в фоне)" if in_bg
+                                         else "Закрыть программу")
+
+    def bring_to_front(self) -> None:
+        if self.isMinimized():
+            self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def handle_instance_message(self, text: str) -> None:
+        """Команда от повторного запуска программы."""
+        if text == "quit":
+            log.info("Выход по команде --quit")
+            self.quit_app()
+            return
+        self.bring_to_front()
+        if text.startswith("open "):
+            url = text[5:].strip()
+            if url:
+                self._open_url(url)
+
+    def quit_app(self) -> None:
+        """Полный выход (меню значка у часов)."""
+        self._quitting = True
+        self.close()
+
+    def _notify_hidden(self, level: str, text: str) -> None:
+        # Всплывающее сообщение — только когда окна не видно.
+        if self.tray is None or self.isVisible() and not self.isMinimized():
+            return
+        if level == "error":
+            self.tray.notify("Ошибка загрузки", text, error=True)
+        elif text.startswith(("Скачано", "Все загрузки")):
+            self.tray.notify("Готово", text)
+
     def closeEvent(self, event) -> None:  # noqa: N802
+        if self.tray is not None and self.ctx.config.run_in_background and not self._quitting:
+            # Окно прячем, программа работает дальше (значок у часов).
+            event.ignore()
+            self.hide()
+            if not self.ctx.config.background_hint_shown:
+                self.ctx.config.background_hint_shown = True
+                self._save_config()
+                self.tray.notify(
+                    "НоуКо Cloud работает в фоне",
+                    "Загрузки продолжаются. Открыть окно — щелчок по значку у часов, "
+                    "выйти — «Выход» в его меню.",
+                )
+            return
+        if self.tray is not None:
+            self.tray.hide()
+        try:
+            self.social_page.cancel_all()
+        except Exception:
+            pass
         # Сначала закрываем плеер — иначе его соединения держат сервер превью.
         try:
             self.preview_panel.stop()
@@ -639,3 +1024,7 @@ class MainWindow(QMainWindow):
             log.debug("Завершение не до конца", exc_info=True)
         self.ctx.runtime.stop()
         super().closeEvent(event)
+        # Окно могло быть скрыто в трей: последнего окна нет — выходим явно.
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()

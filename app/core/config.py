@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 import uuid
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
@@ -33,8 +34,8 @@ class AppConfig:
     # --- Загрузки ---
     download_dir: str = field(default_factory=lambda: str(default_download_dir()))
     max_parallel_files: int = 4          # сколько файлов одновременно
-    max_parallel_segments: int = 4       # сколько кусков одного файла одновременно
-    segment_min_mb: int = 64             # минимальный размер куска
+    max_parallel_segments: int = 12      # сколько частей одного файла качать одновременно
+    segment_min_mb: int = 4              # размер части (МБ)
     use_segments: bool = True            # многопоточная докачка больших файлов
     max_retries: int = 6
     retry_base_delay: float = 1.5
@@ -60,11 +61,24 @@ class AppConfig:
     preview_cache_gb: float = 4.0      # сколько места на диске под кэш превью
     preview_cache_dir: str = ""        # где хранить кэш превью; пусто — в папке загрузок
 
+    # --- Вид ---
+    ui_theme: str = "dark"             # dark | light
+    ui_motion: bool = True             # плавная подсветка кнопок и «живой» фон
+    ui_sounds: bool = True             # звуки интерфейса
+    ui_volume: int = 60                # громкость звуков интерфейса, 0–100
+    #: Закрытие окна сворачивает программу к часам: загрузки идут дальше.
+    run_in_background: bool = True
+    background_hint_shown: bool = False
+    #: Недавние ссылки для стартового экрана: [{"title", "url", "ts"}], новые — первыми.
+    recent_links: list = field(default_factory=list)
+
     # --- Служебное ---
+    #: Версия настроек: по ней старые значения по умолчанию заменяются новыми.
+    config_version: int = 0
     window_geometry: str = ""
     log_level: str = "INFO"
     device_id: str = ""        # идентификатор этой машины для Яндекс.Диска
-    device_name: str = "svsCloud"
+    device_name: str = "NoukoCloud"
 
     # ------------------------------------------------------------------
     @property
@@ -77,7 +91,7 @@ class AppConfig:
     def preview_cache_path(self) -> Path:
         """Папка с файлами кэша превью.
 
-        Это всегда отдельная подпапка `.svscloud-preview` внутри выбранной
+        Это всегда отдельная подпапка `.noukocloud-preview` внутри выбранной
         папки: «Очистить кэш» удаляет только её содержимое и не может задеть
         файлы пользователя, даже если он выбрал общую папку вроде D:\\.
         """
@@ -85,6 +99,17 @@ class AppConfig:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    def remember_link(self, url: str, title: str, limit: int = 8) -> None:
+        """Ставит ссылку первой в «Недавние» (повтор — переносится наверх)."""
+        url = url.strip()
+        if not url:
+            return
+        rest = [r for r in self.recent_links if isinstance(r, dict) and r.get("url") != url]
+        self.recent_links = [{"title": title, "url": url, "ts": time.time()}] + rest[: limit - 1]
+
+    def forget_link(self, url: str) -> None:
+        self.recent_links = [r for r in self.recent_links if isinstance(r, dict) and r.get("url") != url]
 
     def save(self) -> None:
         # Сохраняем только настройки, загруженные из файла пользователя
@@ -114,6 +139,8 @@ class AppConfig:
         _apply_env_overrides(cfg)
         cfg._config_path = CONFIG_FILE
         _repair_download_dir(cfg)
+        migrate_preview_cache(cfg)
+        _upgrade_defaults(cfg)
         if not cfg.device_id:
             # Идентификатор устройства для Яндекс OAuth: пользователь видит
             # в своих настройках, какое устройство имеет доступ к диску,
@@ -141,13 +168,28 @@ class AppConfig:
             setattr(self, key, value)
 
 
-PREVIEW_CACHE_FOLDER = ".svscloud-preview"
+PREVIEW_CACHE_FOLDER = ".noukocloud-preview"
+#: Так папка кэша превью называлась до переименования программы.
+LEGACY_PREVIEW_CACHE_FOLDER = ".svscloud-preview"
 
 
 def preview_cache_path_for(cache_dir: str, download_dir: str) -> Path:
     """Где окажется кэш превью при таких настройках (для показа в «Настройках»)."""
     base = Path((cache_dir or "").strip() or download_dir).expanduser()
     return base / PREVIEW_CACHE_FOLDER
+
+
+def migrate_preview_cache(cfg: "AppConfig") -> None:
+    """Переименовывает старую папку кэша превью, чтобы не скачивать заново
+    и не оставлять гигабайты забытого кэша."""
+    new = cfg.preview_cache_path
+    old = new.with_name(LEGACY_PREVIEW_CACHE_FOLDER)
+    try:
+        if old.is_dir() and not new.exists():
+            old.rename(new)
+            log.info("Кэш превью перенесён: %s -> %s", old, new)
+    except OSError as exc:
+        log.warning("Не удалось перенести кэш превью %s: %s", old, exc)
 
 
 def _repair_download_dir(cfg: AppConfig) -> None:
@@ -167,17 +209,38 @@ def _repair_download_dir(cfg: AppConfig) -> None:
         cfg.download_dir = default
 
 
+CONFIG_VERSION = 2
+
+
+def _upgrade_defaults(cfg: AppConfig) -> None:
+    """Меняет устаревшие значения по умолчанию у сохранённых настроек.
+
+    До версии 2 файл делился на части от 64 МБ по 4 одновременно: Яндекс
+    режет скорость каждого соединения (~0,2–0,4 МБ/с), и файл в 60 МБ
+    качался в один поток пять минут. Значения, которые пользователь менял
+    сам, не трогаем.
+    """
+    if cfg.config_version >= CONFIG_VERSION:
+        return
+    if cfg.max_parallel_segments == 4:
+        cfg.max_parallel_segments = 12
+    if cfg.segment_min_mb == 64:
+        cfg.segment_min_mb = 4
+    cfg.config_version = CONFIG_VERSION
+
+
 def _apply_env_overrides(cfg: AppConfig) -> None:
     """Позволяет задать ключи через переменные окружения (удобно для сборок)."""
     mapping = {
-        "SVSCLOUD_YANDEX_CLIENT_ID": "yandex_client_id",
-        "SVSCLOUD_YANDEX_CLIENT_SECRET": "yandex_client_secret",
-        "SVSCLOUD_GOOGLE_CLIENT_ID": "google_client_id",
-        "SVSCLOUD_GOOGLE_CLIENT_SECRET": "google_client_secret",
-        "SVSCLOUD_GOOGLE_API_KEY": "google_api_key",
+        "NOUKOCLOUD_YANDEX_CLIENT_ID": "yandex_client_id",
+        "NOUKOCLOUD_YANDEX_CLIENT_SECRET": "yandex_client_secret",
+        "NOUKOCLOUD_GOOGLE_CLIENT_ID": "google_client_id",
+        "NOUKOCLOUD_GOOGLE_CLIENT_SECRET": "google_client_secret",
+        "NOUKOCLOUD_GOOGLE_API_KEY": "google_api_key",
     }
     for env_name, attr in mapping.items():
-        value = os.environ.get(env_name)
+        # SVSCLOUD_* — прежние имена переменных, тоже понимаем.
+        value = os.environ.get(env_name) or os.environ.get(env_name.replace("NOUKOCLOUD_", "SVSCLOUD_"))
         if value:
             setattr(cfg, attr, value)
 

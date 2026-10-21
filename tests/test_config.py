@@ -68,5 +68,53 @@ class TestPortableConfig(unittest.TestCase):
         self.assertIsInstance(cfg, AppConfig)
 
 
+class TestRenameMigration(unittest.TestCase):
+    """После переименования svsCloud → НоуКо Cloud ключи и вход не теряются."""
+
+    def test_settings_and_tokens_copied_from_svscloud(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            old = base / "svsCloud"
+            old.mkdir()
+            (old / "config.json").write_text('{"yandex_client_id": "old-id"}', encoding="utf-8")
+            (old / "tokens.dat").write_bytes(b"secret")
+            (base / "YaGoDownloader").mkdir()
+            (base / "YaGoDownloader" / "config.json").write_text("{}", encoding="utf-8")
+            new = base / paths.APP_NAME
+            new.mkdir()
+
+            paths._migrate_legacy(base)
+
+            self.assertEqual(paths.APP_NAME, "NoukoCloud")
+            self.assertIn("old-id", (new / "config.json").read_text(encoding="utf-8"),
+                          "берём из svsCloud, а не из ещё более старой папки")
+            self.assertEqual((new / "tokens.dat").read_bytes(), b"secret")
+            self.assertTrue((old / "config.json").exists(), "старую папку не трогаем")
+
+    def test_existing_new_settings_win(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "svsCloud").mkdir()
+            (base / "svsCloud" / "config.json").write_text('{"a": 1}', encoding="utf-8")
+            new = base / paths.APP_NAME
+            new.mkdir()
+            (new / "config.json").write_text('{"a": 2}', encoding="utf-8")
+            paths._migrate_legacy(base)
+            self.assertEqual((new / "config.json").read_text(encoding="utf-8"), '{"a": 2}')
+
+    def test_preview_cache_folder_renamed(self) -> None:
+        from app.core.config import LEGACY_PREVIEW_CACHE_FOLDER, migrate_preview_cache
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = AppConfig()
+            cfg.download_dir = tmp
+            old = Path(tmp) / LEGACY_PREVIEW_CACHE_FOLDER
+            old.mkdir()
+            (old / "x.dat").write_bytes(b"1")
+            migrate_preview_cache(cfg)
+            self.assertFalse(old.exists())
+            self.assertTrue((cfg.preview_cache_path / "x.dat").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

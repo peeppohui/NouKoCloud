@@ -7,12 +7,13 @@ import shutil
 import sys
 from pathlib import Path
 
-APP_NAME = "svsCloud"
-APP_TITLE = "svsCloud"
+APP_NAME = "NoukoCloud"
+APP_TITLE = "НоуКо Cloud"
 
-#: Каталог с данными предыдущей версии — из него переносим настройки
-#: и токены, чтобы при переименовании не пришлось входить заново.
-LEGACY_APP_NAME = "YaGoDownloader"
+#: Каталоги с данными прежних версий (svsCloud, ещё раньше YaGoDownloader) —
+#: из них переносим настройки и токены, чтобы после переименования
+#: не пришлось вводить ключи и входить заново. Первый найденный — главный.
+LEGACY_APP_NAMES = ("svsCloud", "YaGoDownloader")
 
 
 def is_frozen() -> bool:
@@ -31,19 +32,23 @@ def _base_data_dir() -> Path:
 
 
 def _migrate_legacy(base: Path) -> None:
-    """Переносит настройки и токены из каталога старой версии."""
-    legacy = base / LEGACY_APP_NAME
+    """Копирует настройки и токены из каталога прежней версии.
+
+    Старый каталог не трогаем: можно вернуться на старую версию.
+    """
     current = base / APP_NAME
-    if not legacy.exists() or current == legacy:
-        return
     for name in ("config.json", "tokens.dat"):
-        source = legacy / name
         target = current / name
-        if source.exists() and not target.exists():
-            try:
-                shutil.copy2(source, target)
-            except OSError:
-                pass
+        if target.exists():
+            continue
+        for legacy_name in LEGACY_APP_NAMES:
+            source = base / legacy_name / name
+            if source.exists() and source != target:
+                try:
+                    shutil.copy2(source, target)
+                except OSError:
+                    continue
+                break
 
 
 def app_data_dir() -> Path:
@@ -68,8 +73,23 @@ def logs_dir() -> Path:
     return path
 
 
+def hide_path(path: Path) -> None:
+    """Делает папку скрытой в проводнике Windows (служебные папки программы)."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        FILE_ATTRIBUTE_HIDDEN = 0x2
+        attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+        if attrs != -1 and not attrs & FILE_ATTRIBUTE_HIDDEN:
+            ctypes.windll.kernel32.SetFileAttributesW(str(path), attrs | FILE_ATTRIBUTE_HIDDEN)
+    except Exception:
+        pass
+
+
 def default_download_dir() -> Path:
-    downloads = Path.home() / "Downloads" / "svsCloud"
+    downloads = Path.home() / "Downloads" / "NoukoCloud"
     downloads.mkdir(parents=True, exist_ok=True)
     return downloads
 

@@ -1,6 +1,6 @@
 """Хранение OAuth-токенов.
 
-Токены лежат в %APPDATA%\\svsCloud\\tokens.dat и на Windows
+Токены лежат в %APPDATA%\\NoukoCloud\\tokens.dat и на Windows
 зашифрованы через DPAPI (привязка к пользователю Windows).
 """
 
@@ -30,7 +30,7 @@ except Exception:  # pragma: no cover - на других ОС
 def _protect(data: bytes) -> bytes:
     if _HAS_DPAPI:
         return win32crypt.CryptProtectData(  # type: ignore[union-attr]
-            data, "svsCloud", None, None, None, 0
+            data, "NoukoCloud", None, None, None, 0
         )
     return data
 

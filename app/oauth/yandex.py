@@ -88,7 +88,7 @@ class YandexOAuth(OAuthProvider):
         client_secret: str,
         scopes: tuple[str, ...] = DEFAULT_SCOPES,
         device_id: str = "",
-        device_name: str = "svsCloud",
+        device_name: str = "NoukoCloud",
     ) -> None:
         super().__init__(client_id, client_secret)
         self.scopes = scopes

@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, urlparse
 log = logging.getLogger(__name__)
 
 _PAGE = """<!doctype html><html lang="ru"><head><meta charset="utf-8">
-<title>svsCloud</title>
+<title>НоуКо Cloud</title>
 <style>
  body{{font-family:Segoe UI,sans-serif;background:#f5f6f8;margin:0;display:flex;
       align-items:center;justify-content:center;height:100vh;color:#202124}}

@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
 
 from ..core.models import CloudFile
 from ..preview.player import PreviewPlayer
+from .widgets import button
 
 
 def human_size(size: int) -> str:
@@ -24,36 +25,57 @@ def human_size(size: int) -> str:
     return f"{value:.1f} ТБ"
 
 
+def file_meta(file: CloudFile) -> str:
+    """«MP4 · 4.1 ГБ · изменён 14.10.2026 12:31»."""
+    parts = []
+    ext = file.name.rsplit(".", 1)[-1].upper() if "." in file.name else ""
+    if ext and len(ext) <= 5:
+        parts.append(ext)
+    elif file.mime:
+        parts.append(file.mime)
+    parts.append(human_size(file.size))
+    if file.modified:
+        parts.append(f"изменён {file.modified.strftime('%d.%m.%Y %H:%M')}")
+    return " · ".join(parts)
+
+
 class PreviewPanel(QWidget):
     download_requested = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
-
-        self._title = QLabel("", self)
-        self._title.setProperty("heading", True)
-        self._title.setWordWrap(True)
-        layout.addWidget(self._title)
-
-        self._info = QLabel("", self)
-        self._info.setProperty("muted", True)
-        self._info.setWordWrap(True)
-        layout.addWidget(self._info)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(14)
 
         self.player = PreviewPlayer(self)
         layout.addWidget(self.player, 1)
 
+        info = QVBoxLayout()
+        info.setSpacing(4)
+        self._title = QLabel("", self)
+        self._title.setProperty("role", "name")
+        self._title.setWordWrap(True)
+        info.addWidget(self._title)
+        self._info = QLabel("", self)
+        self._info.setProperty("muted", True)
+        self._info.setWordWrap(True)
+        info.addWidget(self._info)
+        layout.addLayout(info)
+
+        self._hint = QLabel(
+            "Пробел — пауза, ← / → — перемотка на 5 секунд. Файл целиком не скачивается.", self)
+        self._hint.setProperty("role", "hint")
+        self._hint.setWordWrap(True)
+        layout.addWidget(self._hint)
+
         actions = QHBoxLayout()
-        self._btn_download = QPushButton("Скачать только этот файл", self)
+        self._btn_download = button("Скачать только этот файл", "outline", self, icon_name="download")
         self._btn_download.setToolTip(
             "Скачает один файл из предпросмотра. "
             "Чтобы забрать много файлов — отметьте их в дереве слева "
             "и нажмите «Скачать выбранное»."
         )
-        self._btn_download.setProperty("accent", True)
         self._btn_download.clicked.connect(self._emit_download)
         self._btn_download.setEnabled(False)
         actions.addWidget(self._btn_download)
@@ -76,12 +98,7 @@ class PreviewPanel(QWidget):
         """
         self._file = file
         self._title.setText(file.name)
-        details = [f"Размер: {human_size(file.size)}"]
-        if file.mime:
-            details.append(f"Формат: {file.mime}")
-        if file.modified:
-            details.append(f"Изменён: {file.modified.strftime('%d.%m.%Y %H:%M')}")
-        self._info.setText("  ·  ".join(details))
+        self._info.setText(file_meta(file))
         self._btn_download.setEnabled(True)
 
         if message:

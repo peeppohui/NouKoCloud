@@ -128,6 +128,7 @@ class TestTransfer(unittest.IsolatedAsyncioTestCase):
 
         # Имитируем состояние после обрыва: часть файла уже на диске,
         # размер предвыделен (как делает сам загрузчик).
+        job.parts_dir.mkdir(parents=True, exist_ok=True)
         with open(job.part_path, "wb") as handle:
             handle.write(PAYLOAD[:half])
             handle.truncate(len(PAYLOAD))

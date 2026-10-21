@@ -29,6 +29,44 @@ class TestSegments(unittest.TestCase):
         self.assertTrue(validate_segments(segments, total))
         self.assertEqual(segments[-1].end, total - 1)
 
+    def test_many_small_parts_for_speed(self) -> None:
+        """60 МБ при частях по 4 МБ — 15 частей (качаются по N одновременно), а не одна:
+        Яндекс режет скорость каждого соединения, раньше такой файл шёл в один поток."""
+        total = 60 * 1024 * 1024
+        segments = plan_segments(total, segment_size_mb=4)
+        self.assertEqual(len(segments), 15)
+        self.assertTrue(validate_segments(segments, total))
+
+    def test_huge_file_parts_are_capped(self) -> None:
+        total = 50 * 1024 ** 3
+        segments = plan_segments(total, segment_size_mb=4)
+        self.assertLessEqual(len(segments), 512)
+        self.assertTrue(validate_segments(segments, total))
+
+    def test_old_defaults_upgraded_but_user_choice_kept(self) -> None:
+        from app.core.config import AppConfig, _upgrade_defaults
+
+        old = AppConfig()
+        old.max_parallel_segments, old.segment_min_mb, old.config_version = 4, 64, 0
+        _upgrade_defaults(old)
+        self.assertEqual((old.max_parallel_segments, old.segment_min_mb), (12, 4))
+        mine = AppConfig()
+        mine.max_parallel_segments, mine.segment_min_mb, mine.config_version = 6, 32, 0
+        _upgrade_defaults(mine)
+        self.assertEqual((mine.max_parallel_segments, mine.segment_min_mb), (6, 32))
+        again = AppConfig()
+        again.max_parallel_segments, again.config_version = 4, 2
+        _upgrade_defaults(again)
+        self.assertEqual(again.max_parallel_segments, 4, "после обновления выбор «4» — уже ваш")
+
+    def test_download_requests_have_own_quota(self) -> None:
+        from app.net.ratelimit import RateLimiter
+
+        limiter = RateLimiter(4)
+        self.assertEqual(limiter.bucket("yandex").rate, 4)
+        self.assertGreaterEqual(limiter.bucket("yandex-download").rate, 12)
+        self.assertIsNot(limiter.bucket("yandex"), limiter.bucket("yandex-download"))
+
     def test_validate_detects_gap(self) -> None:
         from app.core.models import Segment
 

@@ -1,11 +1,11 @@
 ﻿<#
-    Выпуск релиза svsCloud: сборка -> архив -> публикация на GitHub.
+    Выпуск релиза НоуКо Cloud: сборка -> архив -> публикация на GitHub.
 
     .\packaging\release.ps1 -Version 0.1.0
     .\packaging\release.ps1 -Version 0.2.0 -YandexClientId "..." -YandexClientSecret "..."
 
-    Имя архива всегда svsCloud-win64.zip — чтобы ссылка
-    releases/latest/download/svsCloud-win64.zip не ломалась между версиями.
+    Имя архива всегда NoukoCloud-win64.zip — чтобы ссылка
+    releases/latest/download/NoukoCloud-win64.zip не ломалась между версиями.
 #>
 param(
     [Parameter(Mandatory = $true)]
@@ -37,10 +37,10 @@ if (-not $SkipBuild) {
 }
 
 # --- 2. Архив со стабильным именем ---
-$source = "dist\svsCloud"
+$source = "dist\NoukoCloud"
 if (-not (Test-Path $source)) { throw "нет папки $source" }
 New-Item -ItemType Directory -Force -Path "release" | Out-Null
-$archive = "release\svsCloud-win64.zip"
+$archive = "release\NoukoCloud-win64.zip"
 if (Test-Path $archive) { Remove-Item $archive -Force }
 Compress-Archive -Path "$source\*" -DestinationPath $archive -CompressionLevel Optimal
 $mb = [math]::Round((Get-Item $archive).Length / 1MB, 1)
@@ -51,4 +51,4 @@ python tools\publish_release.py --version $Version
 if ($LASTEXITCODE -ne 0) { throw "Публикация не удалась" }
 
 Write-Host "`nГотово. Постоянная ссылка на скачивание:" -ForegroundColor Green
-Write-Host "https://github.com/peeppohui/svsCloud/releases/latest/download/svsCloud-win64.zip" -ForegroundColor Green
+Write-Host "https://github.com/peeppohui/svsCloud/releases/latest/download/NoukoCloud-win64.zip" -ForegroundColor Green

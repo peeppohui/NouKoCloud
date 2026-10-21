@@ -1,17 +1,17 @@
-# svsCloud
+# НоуКо Cloud
 
 Настольная утилита для монтажёров: открыть папку на **Яндекс.Диске** или
 **Google Диске** (свою или по публичной ссылке), посмотреть превью,
 отметить нужные файлы и скачать их с докачкой.
 
 ![стек](https://img.shields.io/badge/Python-3.12%2B-blue) ![Qt](https://img.shields.io/badge/PySide6-6.12-green)
-[![Скачать](https://img.shields.io/badge/скачать-svsCloud-2f6fed?style=flat-square)](https://github.com/peeppohui/svsCloud/releases/latest/download/svsCloud-win64.zip)
+[![Скачать](https://img.shields.io/badge/скачать-НоуКо Cloud-2f6fed?style=flat-square)](https://github.com/peeppohui/svsCloud/releases/latest/download/NoukoCloud-win64.zip)
 
 ## 📥 Скачать
 
 **[📖 Инструкция для монтажёра](docs/ИНСТРУКЦИЯ.md)** — установка, скачивание по ссылке, превью, настройки, ограничения, решение проблем
 
-**[⬇ Скачать svsCloud для Windows](https://github.com/peeppohui/svsCloud/releases/latest/download/svsCloud-win64.zip)** — 134 МБ
+**[⬇ Скачать НоуКо Cloud для Windows](https://github.com/peeppohui/svsCloud/releases/latest/download/NoukoCloud-win64.zip)** — 103 МБ
 
 ![Окно программы](docs/screenshot.png)
 
@@ -30,7 +30,7 @@ python run.py
 powershell packaging\build.ps1
 ```
 
-Готовый файл: `dist\svsCloud\svsCloud.exe`. ffmpeg для превью не нужен — плеер
+Готовый файл: `dist\NoukoCloud\NoukoCloud.exe`. ffmpeg для превью не нужен — плеер
 уже содержит FFmpeg. `bin\ffmpeg.exe` (см. `tools\fetch_ffmpeg.py`) — только
 запасной путь для редких форматов, которые плеер не открыл.
 

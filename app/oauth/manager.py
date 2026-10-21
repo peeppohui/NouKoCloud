@@ -89,7 +89,7 @@ class OAuthManager:
         provider = self._providers[pid]
         if redirect_uri is None:
             redirect_uri = REDIRECT_URIS[0] if pid is ProviderId.YANDEX else "http://127.0.0.1:8765"
-        return provider.authorization_url(redirect_uri, state="svscloud")
+        return provider.authorization_url(redirect_uri, state="noukocloud")
 
     # ------------------------------------------------------------------
     async def complete_code(self, pid: ProviderId, code: str, redirect_uri: str | None = None) -> str:
@@ -107,7 +107,7 @@ class OAuthManager:
         await server.start()
         # Тот же адрес обязан уйти и в обмен кода — берём его, пока сервер жив.
         redirect_uri = server.redirect_uri
-        url = provider.authorization_url(redirect_uri, state="svscloud")
+        url = provider.authorization_url(redirect_uri, state="noukocloud")
         log.info("Открываем браузер: %s", url)
         await asyncio.to_thread(webbrowser.open, url)
         try:

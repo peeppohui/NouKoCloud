@@ -1,5 +1,5 @@
 ﻿<#
-    Сборка портативной версии svsCloud.
+    Сборка портативной версии НоуКо Cloud.
 
     .\packaging\build.ps1
     .\packaging\build.ps1 -OneFile
@@ -38,7 +38,7 @@ if (-not $SkipFfmpeg) {
 }
 
 Write-Host "==> Убираем старые сборки" -ForegroundColor Cyan
-Get-Process -Name "svsCloud" -ErrorAction SilentlyContinue | Stop-Process -Force
+Get-Process -Name "NoukoCloud" -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Seconds 1
 Remove-Item -Recurse -Force build, dist -ErrorAction SilentlyContinue
 
@@ -51,11 +51,11 @@ $pyiArgs = @(
 )
 # Режим (папка/один файл) задаётся переменной — так совместимо с .spec
 if ($OneFile) {
-    $env:SVSCLOUD_ONEFILE = "1"
+    $env:NOUKOCLOUD_ONEFILE = "1"
 } else {
-    $env:SVSCLOUD_ONEFILE = "0"
+    $env:NOUKOCLOUD_ONEFILE = "0"
 }
-$pyiArgs += "packaging\svscloud.spec"
+$pyiArgs += "packaging\noukocloud.spec"
 
 Write-Host "==> Собираем" -ForegroundColor Cyan
 python @pyiArgs
@@ -63,9 +63,9 @@ if ($LASTEXITCODE -ne 0) { throw "Сборка не удалась" }
 
 # --- Раскладываем рядом с exe ---
 if ($OneFile) {
-    $target = "dist"                      # один файл: dist\svsCloud.exe
+    $target = "dist"                      # один файл: dist\NoukoCloud.exe
 } else {
-    $target = "dist\svsCloud"       # папка: dist\svsCloud\svsCloud.exe
+    $target = "dist\NoukoCloud"       # папка: dist\NoukoCloud\NoukoCloud.exe
 }
 
 Copy-Item -Recurse -Force docs (Join-Path $target "docs") -ErrorAction SilentlyContinue
@@ -90,5 +90,5 @@ if ($filled -eq $portable.Values.Count) {
     Write-Host "    Пользователю придётся ввести недостающие в «Настройках»" -ForegroundColor Yellow
 }
 
-Write-Host "`nГотово: $target\svsCloud.exe" -ForegroundColor Green
+Write-Host "`nГотово: $target\NoukoCloud.exe" -ForegroundColor Green
 Write-Host "Для публикации: zip этого каталога и прикрепите к GitHub Release." -ForegroundColor DarkGray

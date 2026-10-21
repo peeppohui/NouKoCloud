@@ -48,9 +48,16 @@ class RateLimiter:
         self._rate = rate
         self._buckets: dict[str, TokenBucket] = {}
 
+    #: Скачивание частей файла: запросов много (каждая часть — запрос),
+    #: но это не вызовы API, а чтение файла из хранилища.
+    DOWNLOAD_RATE = 12.0
+
+    def _rate_for(self, key: str) -> float:
+        return max(self._rate, self.DOWNLOAD_RATE) if key.endswith("-download") else self._rate
+
     def bucket(self, key: str) -> TokenBucket:
         if key not in self._buckets:
-            self._buckets[key] = TokenBucket(self._rate)
+            self._buckets[key] = TokenBucket(self._rate_for(key))
         return self._buckets[key]
 
     async def acquire(self, key: str) -> None:
@@ -61,5 +68,5 @@ class RateLimiter:
 
     def set_rate(self, rate: float) -> None:
         self._rate = rate
-        for bucket in self._buckets.values():
-            bucket.set_rate(rate)
+        for key, bucket in self._buckets.items():
+            bucket.set_rate(self._rate_for(key))

@@ -50,6 +50,10 @@ RETARGET_SLACK = 4 * 1024 * 1024
 MAX_AHEAD = 300 * 1024 * 1024
 #: Хвост mp4/mov с moov подтягиваем, если он не больше этого.
 MAX_TAIL_PREFETCH = 64 * 1024 * 1024
+# Предзагрузка (файл ещё не открыт, но скорее всего откроют): ровно столько,
+# чтобы плеер сразу показал первый кадр, — начало файла и небольшой хвост.
+WARM_AHEAD = 2 * 1024 * 1024
+WARM_TAIL = 4 * 1024 * 1024
 MAX_FAILURES = 6
 O_BINARY = getattr(os, "O_BINARY", 0)
 
@@ -110,6 +114,8 @@ class StreamCache:
         self._active_reader = 0
         self._retarget = False
         self._closed = False
+        self.ahead_limit = MAX_AHEAD      # сколько качать впереди плеера
+        self.tail_limit = MAX_TAIL_PREFETCH
         self.error = ""
         self.rate = 0.0
         self._rate_mark = (time.monotonic(), 0)
@@ -161,6 +167,14 @@ class StreamCache:
     @property
     def closed(self) -> bool:
         return self._closed
+
+    def set_warm(self, warm: bool) -> None:
+        """Предзагрузка (немного) или настоящий просмотр (с большим запасом)."""
+        self.ahead_limit = WARM_AHEAD if warm else MAX_AHEAD
+        if not warm:
+            self.tail_limit = MAX_TAIL_PREFETCH
+            if self._wake is not None:
+                self._wake.set()          # качальщик ждал — теперь можно дальше
 
     # ------------------------------------------------------------------
     # Чтение (для HTTP-ответа плееру)
@@ -260,7 +274,7 @@ class StreamCache:
         while not self._closed:
             self._retarget = False
             start = self._first_missing(self._target // CHUNK)
-            if start is None or (start * CHUNK - self._reader) > MAX_AHEAD:
+            if start is None or (start * CHUNK - self._reader) > self.ahead_limit:
                 # Впереди всё скачано или запас и так огромный — ждём плеер.
                 self._fetch_next = -1
                 self._wake.clear()
@@ -299,6 +313,11 @@ class StreamCache:
         response = await self._open_range(first_byte, last_byte)
         try:
             status = response.status_code
+            if status == 200 and first_byte > 0:
+                # Облако прислало файл целиком вместо части — сохраняем его по
+                # порядку (всё равно пригодится), пока не дойдём до нужного места.
+                await self._consume_whole(response)
+                return
             if status != 206 and not (status == 200 and first_byte == 0):
                 if 400 <= status < 500 and status not in (408, 429):
                     raise CloudRefused(f"облако ответило {status}")
@@ -316,7 +335,7 @@ class StreamCache:
                     await self._notify()
                     if self._retarget or self._closed:
                         return  # плеер прыгнул в другое место — качаем оттуда
-                    if (idx * CHUNK - self._reader) > MAX_AHEAD:
+                    if (idx * CHUNK - self._reader) > self.ahead_limit:
                         return  # запас огромный — подождём плеер
                     if idx <= end and self._index[idx] >= 0:
                         return  # дальше уже скачано (например, хвост с moov)
@@ -326,6 +345,27 @@ class StreamCache:
                 raise CacheError(f"облако оборвало передачу на куске {idx} из {end}")
         finally:
             await response.aclose()
+
+    async def _consume_whole(self, response) -> None:
+        """Ответ без Range (файл с начала): сохраняем недостающие куски подряд."""
+        idx = 0
+        buf = bytearray()
+        async for data in response.aiter_bytes(64 * 1024):
+            buf += data
+            while idx < self.count and len(buf) >= self._chunk_len(idx):
+                size = self._chunk_len(idx)
+                if self._index[idx] < 0:
+                    self._store(idx, bytes(buf[:size]))
+                    self._fetch_next = idx + 1
+                    await self._notify()
+                del buf[:size]
+                idx += 1
+                if self._closed:
+                    return
+            if idx >= self.count:
+                break
+        if idx < self.count:
+            raise CacheError(f"облако оборвало передачу на куске {idx} из {self.count}")
 
     def _store(self, idx: int, data: bytes) -> None:
         if self._index[idx] >= 0 or self._fd < 0:
@@ -373,7 +413,7 @@ class StreamCache:
             tail_start = find_tail_box(head, self.size)
             if tail_start is None:
                 return
-            if self.size - tail_start > MAX_TAIL_PREFETCH:
+            if self.size - tail_start > self.tail_limit:
                 return
             start = tail_start // CHUNK
             end = self.count - 1
@@ -499,7 +539,7 @@ def clear_directory(directory: Path) -> tuple[int, int]:
     """Удаляет файлы кэша превью: (освобождено байт, не удалось удалить файлов).
 
     Трогаем только файлы прямо в папке кэша (это всегда отдельная папка
-    `.svscloud-preview`), подпапки и всё остальное не трогаем.
+    `.noukocloud-preview`), подпапки и всё остальное не трогаем.
     """
     freed = failed = 0
     try:

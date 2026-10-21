@@ -100,6 +100,36 @@ class TestMainWindow(unittest.TestCase):
         jobs = self.ctx.engine.snapshot()
         self.assertEqual(len(jobs), 141, "в очередь должно встать 141 файл")
 
+    def test_hovered_folder_is_loaded_once(self) -> None:
+        """Мышь задержалась над папкой — список берётся заранее, раскрытие его не повторяет."""
+        import concurrent.futures
+
+        calls = []
+
+        class Provider:
+            async def list_children(self_inner, ctx, file):
+                calls.append(file.name)
+                return [make_file("внутри.mp4")]
+
+        self.ctx.registry.get = lambda pid: Provider()
+        folder = CloudFile(provider=ProviderId.YANDEX, file_id="d", path="/исх", name="исх",
+                           kind=EntryKind.FOLDER, source=SourceKind.PUBLIC)
+        ctx = BrowseContext(source=SourceKind.PUBLIC, public_key="https://disk.yandex.ru/d/X")
+        self.win._on_folder_hovered(folder, ctx)
+        self.win._warm_hovered()
+        future = self.win._prefetched[self.win._folder_key(folder, ctx)][1]
+        future.result(timeout=5)
+        got = []
+        self.win._load_children(folder, ctx, got.append)
+        import time
+
+        deadline = time.time() + 5
+        while not got and time.time() < deadline:
+            QApplication.processEvents()
+            time.sleep(0.01)
+        self.assertEqual([f.name for f in got[0]], ["внутри.mp4"])
+        self.assertEqual(calls, ["исх"], "облако спросили один раз")
+
     def test_my_drive_without_login_shows_hint(self) -> None:
         """Автозагрузка «Моего диска» без входа: без окна, с подсказкой в дереве."""
         self.win.ctx.oauth.is_logged_in = lambda pid: False

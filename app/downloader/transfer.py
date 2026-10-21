@@ -21,6 +21,7 @@ from ..core.config import AppConfig
 from ..core.models import CloudFile, DownloadJob, DownloadLink, JobState, Segment
 from ..net.http_client import HttpClient
 from ..providers.registry import ProviderRegistry
+from ..core.paths import hide_path
 from .segments import plan_segments, validate_segments
 from .state import clear_state, load_state, save_state
 
@@ -100,6 +101,8 @@ class Transfer:
     async def run(self, job: DownloadJob) -> bool:
         """Скачивает файл. True — успех."""
         job.dest_dir.mkdir(parents=True, exist_ok=True)
+        job.parts_dir.mkdir(parents=True, exist_ok=True)
+        hide_path(job.parts_dir)
         if self._pick_target_name(job):
             log.info("Уже скачан: %s", job.final_path.name)
             job.state = JobState.SKIPPED
@@ -180,11 +183,7 @@ class Transfer:
         if not self._config.use_segments or total <= 0:
             segments = [Segment(index=0, start=0, end=max(0, total - 1))]
         else:
-            segments = plan_segments(
-                total,
-                segment_size_mb=self._config.segment_min_mb,
-                max_segments=max(2, self._config.max_parallel_segments * 2),
-            )
+            segments = plan_segments(total, segment_size_mb=self._config.segment_min_mb)
         # Создаём/обрезаем файл до нужного размера — так pwrite пишет
         # в правильные смещения, а дырок не остаётся.
         fd = os.open(str(job.part_path), os.O_RDWR | os.O_CREAT | O_BINARY, 0o666)
@@ -228,7 +227,7 @@ class Transfer:
         return 0
 
     def _provider_key(self, file: CloudFile) -> str:
-        return file.provider.value
+        return f"{file.provider.value}-download"
 
     # ------------------------------------------------------------------
     async def _run_parallel(self, job: DownloadJob, link: DownloadLink, fd: int) -> None:
@@ -242,11 +241,16 @@ class Transfer:
         ]
         if not tasks:
             return
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        try:
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        finally:
+            # И при ошибке, и при отмене всей загрузки: части не должны
+            # писать в файл после того, как он закрыт.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
         errors = [task.exception() for task in done if not task.cancelled() and task.exception()]
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
         if errors:
             raise errors[0]
 
@@ -303,6 +307,13 @@ class Transfer:
                 # Диапазон за пределами файла — считаем сегмент полученным.
                 seg.received = seg.total
                 return
+            if status >= 500:
+                # Сбой хранилища на запросе части файла. Ссылку перевыпускаем
+                # (Яндекс привязывает её к узлу), а если сбой повторится —
+                # ServerCutStream: файл скачается целиком одним потоком, без
+                # частей (некоторые файлы Яндекс по частям не отдаёт вовсе).
+                await self._refresh_link(job)
+                raise ServerCutStream(f"облако ответило {status} на запрос части файла")
             if status in (401, 403, 404):
                 # Ссылка протухла — перевыпускаем и пробуем снова.
                 await self._refresh_link(job)
@@ -395,7 +406,7 @@ class Transfer:
         )
         try:
             status = response.status_code
-            if status in (401, 403, 404):
+            if status in (401, 403, 404) or status >= 500:
                 await self._refresh_link(job)
                 raise httpx.HTTPStatusError(
                     f"ссылка протухла ({status})", request=response.request, response=response

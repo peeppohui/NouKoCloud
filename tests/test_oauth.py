@@ -19,7 +19,7 @@ class TestYandexOAuth(unittest.TestCase):
         self.oauth = YandexOAuth("client-id", "client-secret", device_id="dev123", device_name="Тест")
 
     def test_authorization_url(self) -> None:
-        url = self.oauth.authorization_url(REDIRECT_URIS[0], state="svscloud")
+        url = self.oauth.authorization_url(REDIRECT_URIS[0], state="noukocloud")
         parsed = urlparse(url)
         params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
         self.assertEqual(parsed.netloc, "oauth.yandex.com")
@@ -83,7 +83,7 @@ class TestGoogleOAuth(unittest.TestCase):
         self.oauth = GoogleOAuth("id.apps.googleusercontent.com", "secret")
 
     def test_authorization_url(self) -> None:
-        url = self.oauth.authorization_url("http://127.0.0.1:5555/", state="svscloud")
+        url = self.oauth.authorization_url("http://127.0.0.1:5555/", state="noukocloud")
         params = {k: v[0] for k, v in parse_qs(urlparse(url).query).items()}
         self.assertEqual(params["response_type"], "code")
         self.assertEqual(params["access_type"], "offline")

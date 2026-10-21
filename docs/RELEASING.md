@@ -26,9 +26,9 @@ README.md, LICENSE, .gitignore, .gitattributes
 | `dist/` (328 МБ) | бинарная сборка, git её не любит | GitHub **Releases** |
 | `build/` | промежуточные файлы PyInstaller | генерируется при сборке |
 | `bin/ffmpeg.exe` (~80 МБ) | чужая программа | качается скриптом `tools/fetch_ffmpeg.py` |
-| `config.json` | **ключи OAuth** | `%APPDATA%\svsCloud\config.json` |
-| `tokens.dat` | **токены входа** (DPAPI) | `%APPDATA%\svsCloud\tokens.dat` |
-| `*.log`, `cache.db`, `*.part` | личные данные и мусор | `%APPDATA%\svsCloud\` |
+| `config.json` | **ключи OAuth** | `%APPDATA%\NoukoCloud\config.json` |
+| `tokens.dat` | **токены входа** (DPAPI) | `%APPDATA%\NoukoCloud\tokens.dat` |
+| `*.log`, `cache.db`, `*.part` | личные данные и мусор | `%APPDATA%\NoukoCloud\` |
 
 Всё это уже закрыто `.gitignore`. **Перед первым коммитом проверьте:**
 
@@ -52,15 +52,15 @@ git ls-files | Select-String "config.json|tokens.dat|dist/|bin/"
 ### Шаг 1. Собрать
 
 ```powershell
-git clone https://github.com/<ваш-аккаунт>/svsCloud.git
-cd svsCloud
+git clone https://github.com/<ваш-аккаунт>/НоуКо Cloud.git
+cd НоуКо Cloud
 packaging\build.ps1 `
     -YandexClientId "1234567890" -YandexClientSecret "секрет" `
     -GoogleClientId "xxxx.apps.googleusercontent.com" -GoogleClientSecret "GOCSPX-..." `
     -GoogleApiKey "AIza..."
 ```
 
-Скрипт сам поставит зависимости, скачает ffmpeg, соберёт `dist\svsCloud\`
+Скрипт сам поставит зависимости, скачает ffmpeg, соберёт `dist\NoukoCloud\`
 и положит рядом с exe `config.json` с ключами — **пользователю не нужно
 ничего вводить, достаточно нажать «Аккаунты» → «Войти»**.
 
@@ -71,7 +71,7 @@ packaging\build.ps1 `
 
 ```powershell
 git add .
-git commit -m "svsCloud 0.1.0"
+git commit -m "НоуКо Cloud 0.1.0"
 git tag v0.1.0
 git push origin main --tags
 ```
@@ -81,7 +81,7 @@ git push origin main --tags
 На странице репозитория: **Releases → Draft a new release → v0.1.0**.
 
 Приложить:
-* `dist\svsCloud` — запакованным в zip (например `svsCloud-0.1.0-win64.zip`);
+* `dist\NoukoCloud` — запакованным в zip (например `НоуКо Cloud-0.1.0-win64.zip`);
   GitHub не примет папку, только файл;
 * `docs\ARCHITECTURE.md` и `docs\OAUTH_SETUP.md` — если хотите, чтобы они были
   видны прямо на странице релиза (обычно достаточно ссылки на репозиторий).
@@ -95,7 +95,7 @@ git push origin main --tags
 packaging\build.ps1 -OneFile
 ```
 
-Получится один `svsCloud.exe`, который сам распаковывается во
+Получится один `NoukoCloud.exe`, который сам распаковывается во
 временную папку при запуске. Запускается чуть медленнее, но пользователю
 удобнее («один файл — и работает»). ffmpeg в этом случае всё равно должен
 лежать рядом отдельной папкой `bin/`.

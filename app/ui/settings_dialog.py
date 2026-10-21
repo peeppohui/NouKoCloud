@@ -7,6 +7,7 @@ from typing import Protocol
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QBoxLayout,
     QCheckBox,
     QDialog,
     QDoubleSpinBox,
@@ -18,13 +19,18 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressBar,
     QPushButton,
+    QSlider,
     QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
+from ..core import autostart
 from ..core.config import AppConfig, preview_cache_path_for
+from . import theme
+from .widgets import OverlayDialog, button, label, responsive_box
 
 
 class CacheOps(Protocol):
@@ -44,171 +50,271 @@ def human_size(size: int) -> str:
     return f"{value:.1f} ТБ"
 
 
-class SettingsDialog(QDialog):
+class SettingsDialog(OverlayDialog):
     def __init__(self, config: AppConfig, parent: QWidget | None = None,
                  cache_ops: CacheOps | None = None) -> None:
-        super().__init__(parent)
+        # В Soyuz Grotesk нет буквы «й» — её набираем шрифтом Actay Wide (как в макете).
+        super().__init__(
+            f'настро<span style="font-family:\'{theme.WIDE}\'">й</span>ки', parent, max_width=1000)
         self._config = config
         self._cache_ops = cache_ops
         self.setWindowTitle("Настройки")
-        self.setMinimumWidth(620)
 
-        layout = QVBoxLayout(self)
-        layout.setSpacing(14)
+        columns = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        columns.setSpacing(16)
+        self.body_layout.addLayout(columns)
+        self._columns_bp = responsive_box(columns, self, 900)
 
         # --- Ключи приложений ---
-        keys_box = QGroupBox("Доступ к облакам", self)
-        keys_form = QFormLayout(keys_box)
-        keys_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        keys_box = QGroupBox("ДОСТУП К ОБЛАКАМ", self.body)
+        keys = QVBoxLayout(keys_box)
+        keys.setSpacing(12)
 
-        self._yandex_id = QLineEdit(config.yandex_client_id, keys_box)
-        self._yandex_id.setPlaceholderText("Client ID из oauth.yandex.ru")
-        self._yandex_secret = QLineEdit(config.yandex_client_secret, keys_box)
-        self._yandex_secret.setEchoMode(QLineEdit.EchoMode.Password)
-        self._yandex_secret.setPlaceholderText("Client Secret")
-        keys_form.addRow("Яндекс.Диск — Client ID", self._yandex_id)
-        keys_form.addRow("Яндекс.Диск — Client Secret", self._yandex_secret)
+        def key_field(text: str, value: str, placeholder: str, secret: bool = False) -> QLineEdit:
+            keys.addWidget(label(text, None, keys_box))
+            edit = QLineEdit(value, keys_box)
+            edit.setPlaceholderText(placeholder)
+            edit.setAccessibleName(text)
+            if secret:
+                edit.setEchoMode(QLineEdit.EchoMode.Password)
+            keys.addWidget(edit)
+            keys.addSpacing(4)
+            return edit
 
-        self._google_id = QLineEdit(config.google_client_id, keys_box)
-        self._google_id.setPlaceholderText("Client ID из console.cloud.google.com")
-        self._google_secret = QLineEdit(config.google_client_secret, keys_box)
-        self._google_secret.setEchoMode(QLineEdit.EchoMode.Password)
-        self._google_secret.setPlaceholderText("Client Secret")
-        self._google_api_key = QLineEdit(config.google_api_key, keys_box)
-        self._google_api_key.setPlaceholderText("Необязательно: для публичных папок без входа")
-        keys_form.addRow("Google Диск — Client ID", self._google_id)
-        keys_form.addRow("Google Диск — Client Secret", self._google_secret)
-        keys_form.addRow("Google Диск — API Key", self._google_api_key)
+        self._yandex_id = key_field("Яндекс.Диск — Client ID", config.yandex_client_id,
+                                    "Client ID из oauth.yandex.ru")
+        self._yandex_secret = key_field("Яндекс.Диск — Client Secret", config.yandex_client_secret,
+                                        "Client Secret", secret=True)
+        self._google_id = key_field("Google Диск — Client ID", config.google_client_id,
+                                    "Client ID из console.cloud.google.com")
+        self._google_secret = key_field("Google Диск — Client Secret", config.google_client_secret,
+                                        "Client Secret", secret=True)
+        self._google_api_key = key_field("Google Диск — API Key", config.google_api_key,
+                                         "Необязательно: для публичных папок без входа")
+        keys.addWidget(label(
+            "Ключи нужны только для своего «Моего диска» — чужие ссылки работают без них.",
+            "hint", keys_box, wrap=True))
+        guide = button("Инструкция: как получить ключи", "soft", keys_box)
+        guide.clicked.connect(self._show_guide)
+        keys.addWidget(guide, 0, Qt.AlignmentFlag.AlignLeft)
+        keys.addStretch(1)
+        left = QVBoxLayout()
+        left.setSpacing(16)
+        left.addWidget(keys_box, 1)
+        ui_box = QGroupBox("ИНТЕРФЕЙС", self.body)
+        ui = QVBoxLayout(ui_box)
+        ui.setSpacing(12)
+        self._ui_motion = QCheckBox("Анимации кнопок (плавная подсветка)", ui_box)
+        self._ui_motion.setChecked(bool(getattr(config, "ui_motion", True)))
+        self._ui_sounds = QCheckBox("Звуки интерфейса", ui_box)
+        self._ui_sounds.setChecked(bool(getattr(config, "ui_sounds", True)))
+        ui.addWidget(self._ui_motion)
+        ui.addWidget(self._ui_sounds)
+        volume_row = QHBoxLayout()
+        volume_row.setSpacing(12)
+        volume_row.addWidget(label("Громкость звуков", None, ui_box))
+        self._ui_volume = QSlider(Qt.Orientation.Horizontal, ui_box)
+        self._ui_volume.setRange(0, 100)
+        self._ui_volume.setValue(int(getattr(config, "ui_volume", 60)))
+        self._ui_volume.setAccessibleName("Громкость звуков интерфейса")
+        volume_row.addWidget(self._ui_volume, 1)
+        self._ui_volume_label = label("", "muted", ui_box)
+        self._ui_volume_label.setMinimumWidth(44)
+        volume_row.addWidget(self._ui_volume_label)
+        ui.addLayout(volume_row)
+        self._ui_volume.valueChanged.connect(self._on_volume_changed)
+        # Отпустили ползунок — проигрываем образец, чтобы было слышно громкость.
+        self._ui_volume.sliderReleased.connect(self._preview_volume)
+        self._ui_sounds.toggled.connect(self._ui_volume.setEnabled)
+        self._ui_volume.setEnabled(self._ui_sounds.isChecked())
+        self._on_volume_changed(self._ui_volume.value())
+        left.addWidget(ui_box)
 
-        hint = QLabel(
-            "Как получить ключи — пошаговая инструкция в файле docs/OAUTH_SETUP.md "
-            "(или папке «Документация» рядом с программой).",
-            keys_box,
-        )
-        hint.setProperty("muted", True)
-        hint.setWordWrap(True)
-        keys_form.addRow(hint)
-        layout.addWidget(keys_box)
+        bg_box = QGroupBox("РАБОТА В ФОНЕ", self.body)
+        bg = QVBoxLayout(bg_box)
+        bg.setSpacing(12)
+        self._run_bg = QCheckBox("Не закрываться, а работать в фоне (значок у часов)", bg_box)
+        self._run_bg.setChecked(bool(getattr(config, "run_in_background", True)))
+        self._run_bg.setToolTip("Крестик прячет окно, загрузки идут дальше. "
+                                "Выйти полностью — «Выход» в меню значка у часов")
+        bg.addWidget(self._run_bg)
+        self._autostart = QCheckBox("Запускать вместе с Windows (сразу в фоне)", bg_box)
+        self._autostart.setChecked(autostart.enabled())
+        if not autostart.supported():
+            self._autostart.setEnabled(False)
+            self._autostart.setToolTip("Доступно в собранной программе (NoukoCloud.exe)")
+        bg.addWidget(self._autostart)
+        left.addWidget(bg_box)
+        columns.addLayout(left, 1)
+
+        right = QVBoxLayout()
+        right.setSpacing(16)
+        columns.addLayout(right, 1)
 
         # --- Загрузки ---
-        downloads_box = QGroupBox("Загрузки", self)
-        downloads_form = QFormLayout(downloads_box)
-        downloads_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-
+        downloads_box = QGroupBox("ЗАГРУЗКИ", self.body)
+        downloads = QVBoxLayout(downloads_box)
+        downloads.setSpacing(12)
+        downloads.addWidget(label("Папка загрузок", None, downloads_box))
         dir_row = QHBoxLayout()
+        dir_row.setSpacing(8)
         self._dir = QLineEdit(config.download_dir, downloads_box)
-        browse = QPushButton("Обзор…", downloads_box)
+        self._dir.setAccessibleName("Папка загрузок")
+        browse = button("Обзор…", "soft", downloads_box)
         browse.clicked.connect(self._pick_dir)
-        dir_row.addWidget(self._dir)
+        dir_row.addWidget(self._dir, 1)
         dir_row.addWidget(browse)
-        downloads_form.addRow("Папка загрузок", dir_row)
+        downloads.addLayout(dir_row)
+
+        def number_row(text: str, spin, unit: str = "") -> None:
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            row.addWidget(label(text, None, downloads_box), 1)
+            spin.setFixedWidth(96 if unit != "Мбит/с" else 110)
+            spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            spin.setAccessibleName(text)
+            row.addWidget(spin)
+            unit_label = label(unit, "muted", downloads_box)
+            unit_label.setMinimumWidth(48)
+            row.addWidget(unit_label)
+            downloads.addLayout(row)
 
         self._parallel = QSpinBox(downloads_box)
         self._parallel.setRange(1, 16)
         self._parallel.setValue(config.max_parallel_files)
         self._parallel.setToolTip("Сколько файлов качать одновременно")
-        downloads_form.addRow("Файлов одновременно", self._parallel)
+        number_row("Файлов одновременно", self._parallel)
 
         self._segments = QSpinBox(downloads_box)
-        self._segments.setRange(1, 16)
+        self._segments.setRange(1, 32)
         self._segments.setValue(config.max_parallel_segments)
-        self._segments.setToolTip("Сколько частей одного большого файла качать одновременно")
-        downloads_form.addRow("Частей одного файла", self._segments)
+        self._segments.setToolTip("Сколько частей одного файла качать одновременно. Облако режет скорость "
+                                  "каждого соединения, поэтому больше частей — быстрее (обычно 8–16)")
+        number_row("Частей одного файла", self._segments)
 
         self._segment_mb = QSpinBox(downloads_box)
-        self._segment_mb.setRange(8, 2048)
-        self._segment_mb.setSingleStep(8)
+        self._segment_mb.setRange(1, 2048)
+        self._segment_mb.setSingleStep(1)
         self._segment_mb.setValue(config.segment_min_mb)
-        self._segment_mb.setSuffix(" МБ")
-        self._segment_mb.setToolTip("Минимальный размер части. Файл меньше — качается целиком")
-        downloads_form.addRow("Размер части от", self._segment_mb)
-
-        self._use_segments = QCheckBox("Докачивать большие файлы по частям", downloads_box)
-        self._use_segments.setChecked(config.use_segments)
-        downloads_form.addRow(self._use_segments)
+        self._segment_mb.setToolTip("Размер одной части. Меньше — больше частей и соединений "
+                                    "(быстрее на медленном облаке); файл не больше части качается целиком")
+        number_row("Размер части", self._segment_mb, "МБ")
 
         self._speed = QSpinBox(downloads_box)
         self._speed.setRange(0, 10000)
         self._speed.setValue(config.download_speed_limit_mbps)
-        self._speed.setSpecialValueText("Без ограничения")
-        self._speed.setSuffix(" Мбит/с")
-        downloads_form.addRow("Ограничение скорости", self._speed)
-        layout.addWidget(downloads_box)
+        self._speed.setSpecialValueText("нет")
+        self._speed.setToolTip("0 — без ограничения")
+        number_row("Ограничение скорости", self._speed, "Мбит/с")
+
+        self._use_segments = QCheckBox("Докачивать большие файлы по частям", downloads_box)
+        self._use_segments.setChecked(config.use_segments)
+        downloads.addWidget(self._use_segments)
+        right.addWidget(downloads_box)
 
         # --- Превью ---
-        preview_box = QGroupBox("Превью", self)
-        preview_form = QFormLayout(preview_box)
-        preview_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        preview_box = QGroupBox("ПРЕВЬЮ", self.body)
+        preview = QVBoxLayout(preview_box)
+        preview.setSpacing(12)
+        preview.addWidget(label("Путь к ffmpeg", None, preview_box))
+        ffmpeg_row = QHBoxLayout()
+        ffmpeg_row.setSpacing(8)
         self._ffmpeg = QLineEdit(config.ffmpeg_path, preview_box)
         self._ffmpeg.setPlaceholderText("Оставьте пустым — найдём в системе")
-        ffmpeg_row = QHBoxLayout()
-        ffmpeg_row.addWidget(self._ffmpeg)
-        ffmpeg_browse = QPushButton("Обзор…", preview_box)
+        self._ffmpeg.setAccessibleName("Путь к ffmpeg")
+        ffmpeg_row.addWidget(self._ffmpeg, 1)
+        ffmpeg_browse = button("Обзор…", "soft", preview_box)
         ffmpeg_browse.clicked.connect(self._pick_ffmpeg)
         ffmpeg_row.addWidget(ffmpeg_browse)
-        preview_form.addRow("Путь к ffmpeg", ffmpeg_row)
+        preview.addLayout(ffmpeg_row)
 
         # Кэш превью: где лежит, сколько занимает, очистка.
+        preview.addWidget(label("Папка кэша превью", None, preview_box))
         cache_row = QHBoxLayout()
+        cache_row.setSpacing(8)
         self._cache_dir = QLineEdit(config.preview_cache_dir, preview_box)
         self._cache_dir.setPlaceholderText("По умолчанию — в папке загрузок")
+        self._cache_dir.setAccessibleName("Папка кэша превью")
         self._cache_dir.setToolTip(
             "Куда складывать скачанные для превью куски видео. Удобно выбрать "
             "быстрый диск с запасом места. Внутри выбранной папки программа "
-            "создаст свою подпапку .svscloud-preview и будет работать только в ней."
+            "создаст свою подпапку .noukocloud-preview и будет работать только в ней."
         )
         self._cache_dir.textChanged.connect(self._update_cache_info)
-        cache_row.addWidget(self._cache_dir)
-        cache_browse = QPushButton("Обзор…", preview_box)
+        cache_row.addWidget(self._cache_dir, 1)
+        cache_browse = button("Обзор…", "soft", preview_box)
         cache_browse.clicked.connect(self._pick_cache_dir)
         cache_row.addWidget(cache_browse)
-        cache_default = QPushButton("По умолчанию", preview_box)
+        cache_default = button("По умолчанию", "link", preview_box)
         cache_default.setToolTip("Хранить кэш в папке загрузок")
         cache_default.clicked.connect(lambda: self._cache_dir.setText(""))
         cache_row.addWidget(cache_default)
-        preview_form.addRow("Папка кэша превью", cache_row)
+        preview.addLayout(cache_row)
 
-        self._cache_path_label = QLabel("", preview_box)
-        self._cache_path_label.setProperty("muted", True)
-        self._cache_path_label.setWordWrap(True)
+        self._cache_path_label = label("", "hint", preview_box, wrap=True)
         self._cache_path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        preview_form.addRow("", self._cache_path_label)
+        preview.addWidget(self._cache_path_label)
 
+        limit_row = QHBoxLayout()
+        limit_row.setSpacing(8)
+        limit_row.addWidget(label("Предел кэша", None, preview_box), 1)
         self._cache_limit = QDoubleSpinBox(preview_box)
         self._cache_limit.setRange(0.5, 1000.0)
         self._cache_limit.setDecimals(1)
         self._cache_limit.setSingleStep(1.0)
-        self._cache_limit.setSuffix(" ГБ")
         self._cache_limit.setValue(float(config.preview_cache_gb))
+        self._cache_limit.setFixedWidth(96)
+        self._cache_limit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._cache_limit.setAccessibleName("Предел кэша, ГБ")
         self._cache_limit.setToolTip("Больше этого объёма кэш не займёт: старое удаляется само")
-        preview_form.addRow("Предел кэша", self._cache_limit)
+        self._cache_limit.valueChanged.connect(self._update_cache_info)
+        limit_row.addWidget(self._cache_limit)
+        unit = label("ГБ", "muted", preview_box)
+        unit.setMinimumWidth(48)
+        limit_row.addWidget(unit)
+        preview.addLayout(limit_row)
+
+        usage_head = QHBoxLayout()
+        usage_head.addWidget(label("Занято", None, preview_box))
+        usage_head.addStretch(1)
+        self._cache_usage = QLabel("", preview_box)
+        self._cache_usage.setWordWrap(True)
+        self._cache_usage.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        usage_head.addWidget(self._cache_usage, 3)
+        preview.addLayout(usage_head)
+        self._cache_bar = QProgressBar(preview_box)
+        self._cache_bar.setRange(0, 1000)
+        self._cache_bar.setTextVisible(False)
+        self._cache_bar.setFixedHeight(6)
+        preview.addWidget(self._cache_bar)
 
         usage_row = QHBoxLayout()
-        self._cache_usage = QLabel("", preview_box)
-        usage_row.addWidget(self._cache_usage, 1)
-        self._cache_open = QPushButton("Открыть папку", preview_box)
+        usage_row.setSpacing(8)
+        self._cache_open = button("Открыть папку", "soft", preview_box)
         self._cache_open.clicked.connect(self._open_cache_folder)
         usage_row.addWidget(self._cache_open)
-        self._cache_clear = QPushButton("Очистить кэш", preview_box)
+        self._cache_clear = button("Очистить кэш", "soft", preview_box)
         self._cache_clear.setToolTip(
             "Удалить всё, что скачано для превью. Скачанные файлы в папке загрузок не трогаются."
         )
         self._cache_clear.clicked.connect(self._clear_cache)
         usage_row.addWidget(self._cache_clear)
-        preview_form.addRow("Занято", usage_row)
-        layout.addWidget(preview_box)
+        usage_row.addStretch(1)
+        preview.addLayout(usage_row)
+        right.addWidget(preview_box)
+        right.addStretch(1)
+
         self._dir.textChanged.connect(self._update_cache_info)
         self._update_cache_info()
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel, self
-        )
-        # Переводы Qt в сборку не входят — подписываем кнопки сами.
-        buttons.button(QDialogButtonBox.StandardButton.Save).setText("Сохранить")
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
-        buttons.accepted.connect(self._save)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        cancel = button("Отмена", "outline", self.card, size="xl")
+        cancel.clicked.connect(self.reject)
+        save = button("Сохранить", "primary", self.card)
+        save.setDefault(False)
+        save.setAutoDefault(False)
+        save.clicked.connect(self._save)
+        self.footer.addWidget(cancel)
+        self.footer.addWidget(save)
 
     # ------------------------------------------------------------------
     def _pick_dir(self) -> None:
@@ -238,9 +344,12 @@ class SettingsDialog(QDialog):
             self._cache_open.setEnabled(False)
             return
         size, files = self._cache_ops.usage(current)
+        limit = float(self._cache_limit.value()) * 1024 ** 3
         self._cache_usage.setText(
-            f"{human_size(size)} · файлов: {files}" if files else "Кэш пуст"
+            f"{human_size(size)} из {self._cache_limit.value():g} ГБ · файлов: {files}"
+            if files else "Кэш пуст"
         )
+        self._cache_bar.setValue(int(1000 * min(1.0, size / limit)) if limit else 0)
         self._cache_clear.setEnabled(files > 0)
 
     def _pick_cache_dir(self) -> None:
@@ -274,6 +383,24 @@ class SettingsDialog(QDialog):
         )
         return answer == QMessageBox.StandardButton.Yes
 
+    def _show_guide(self) -> None:
+        from .help_dialog import HelpDialog
+
+        HelpDialog(self.parentWidget() or self).exec()
+
+    def _on_volume_changed(self, value: int) -> None:
+        self._ui_volume_label.setText(f"{value}%")
+
+    def _preview_volume(self) -> None:
+        from . import sound
+
+        bank = sound.bank()
+        previous = bank.enabled
+        bank.enabled = True
+        bank.set_volume(self._ui_volume.value())
+        bank.play("open", force=True)
+        bank.enabled = previous
+
     def _pick_ffmpeg(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Найти ffmpeg", self._ffmpeg.text())
         if path:
@@ -293,6 +420,12 @@ class SettingsDialog(QDialog):
         config.use_segments = self._use_segments.isChecked()
         config.download_speed_limit_mbps = self._speed.value()
         config.ffmpeg_path = self._ffmpeg.text().strip()
+        config.ui_motion = self._ui_motion.isChecked()
+        config.ui_sounds = self._ui_sounds.isChecked()
+        config.ui_volume = self._ui_volume.value()
+        config.run_in_background = self._run_bg.isChecked()
+        if self._autostart.isEnabled() and self._autostart.isChecked() != autostart.enabled():
+            autostart.set_enabled(self._autostart.isChecked())
 
         old_cache = self._current_cache_path()
         config.preview_cache_dir = self._cache_dir.text().strip()

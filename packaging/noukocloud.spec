@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""Сборка svsCloud в один .exe (PyInstaller)."""
+"""Сборка НоуКо Cloud в один .exe (PyInstaller)."""
 
 import os
 import sys
@@ -11,8 +11,8 @@ ROOT = Path(SPECPATH).resolve()
 if ROOT.name == "packaging":   # spec-файл лежит в packaging/, проект — уровнем выше
     ROOT = ROOT.parent
 
-# SVSCLOUD_ONEFILE=1 — собираем одним файлом (build.ps1 -OneFile)
-ONEFILE = os.environ.get("SVSCLOUD_ONEFILE", "0") == "1"
+# NOUKOCLOUD_ONEFILE=1 — собираем одним файлом (build.ps1 -OneFile)
+ONEFILE = os.environ.get("NOUKOCLOUD_ONEFILE", "0") == "1"
 
 block_cipher = None
 
@@ -39,6 +39,8 @@ datas += [
     (str(ROOT / "docs"), "docs"),
     # Иконки флажков дерева (галочка/чёрточка) — их читает таблица стилей.
     (str(ROOT / "app" / "ui" / "icons"), "app/ui/icons"),
+    # Оформление «НоуКо»: шрифты, логотипы, сетка звёзд.
+    (str(ROOT / "app" / "ui" / "assets"), "app/ui/assets"),
 ]
 
 hiddenimports = [
@@ -51,7 +53,14 @@ hiddenimports = [
     "PySide6.QtMultimedia",
     "PySide6.QtMultimediaWidgets",
     "PySide6.QtNetwork",
+    # Иконки интерфейса рисуются из SVG.
+    "PySide6.QtSvg",
 ]
+# Вкладка «Соцсети»: yt-dlp грузит обработчики сайтов лениво — забираем все.
+try:
+    hiddenimports += collect_submodules("yt_dlp")
+except Exception:  # pragma: no cover - yt-dlp не установлен
+    print("  ВНИМАНИЕ: yt-dlp не установлен — вкладка «Соцсети» не будет работать")
 hiddenimports += collect_submodules("app")
 
 a = Analysis(
@@ -80,7 +89,7 @@ if ONEFILE:
         a.binaries,
         a.datas,
         [],
-        name="svsCloud",
+        name="NoukoCloud",
         debug=False,
         bootloader_ignore_signals=False,
         strip=False,
@@ -100,7 +109,7 @@ else:
         a.scripts,
         [],
         exclude_binaries=True,
-        name="svsCloud",
+        name="NoukoCloud",
         debug=False,
         bootloader_ignore_signals=False,
         strip=False,
@@ -122,7 +131,7 @@ else:
         strip=False,
         upx=False,
         upx_exclude=[],
-        name="svsCloud",
+        name="NoukoCloud",
     )
 
 
@@ -158,9 +167,39 @@ def _trim_languages(target: Path) -> None:
                 pass
 
 
+def _bundle_ffmpeg(target: Path) -> None:
+    """Кладёт ffmpeg (bin/ffmpeg.exe + лицензия) рядом с программой.
+
+    Пользователь скачивает один архив — ffmpeg уже внутри. Если в проекте
+    его ещё нет, скачиваем (tools/fetch_ffmpeg.py). NOUKOCLOUD_SKIP_FFMPEG=1 —
+    собрать без него (быстрая проверочная сборка).
+    """
+    import shutil
+    import subprocess
+
+    if os.environ.get("NOUKOCLOUD_SKIP_FFMPEG") == "1":
+        print("  ffmpeg: пропущен (NOUKOCLOUD_SKIP_FFMPEG=1)")
+        return
+    source = ROOT / "bin"
+    if not (source / "ffmpeg.exe").exists():
+        print("  ffmpeg: скачиваем…")
+        subprocess.run([sys.executable, str(ROOT / "tools" / "fetch_ffmpeg.py")], check=False)
+    if not (source / "ffmpeg.exe").exists():
+        print("  ВНИМАНИЕ: ffmpeg не скачался — сборка без него")
+        return
+    dest = target / "bin"
+    dest.mkdir(parents=True, exist_ok=True)
+    for item in source.iterdir():
+        # ffprobe программе не нужен (−100 МБ к архиву).
+        if item.is_file() and item.name.lower() != "ffprobe.exe":
+            shutil.copy2(item, dest / item.name)
+    print(f"  ffmpeg: {dest}")
+
+
 if not ONEFILE:
     try:
         _target = Path(DISTPATH) / coll.name
     except NameError:  # pragma: no cover
         _target = Path(SPECPATH).parent / "dist" / coll.name
     _trim_languages(_target)
+    _bundle_ffmpeg(_target)

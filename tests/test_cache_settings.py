@@ -33,8 +33,8 @@ def setUpModule() -> None:
 class TestCachePath(unittest.TestCase):
     def test_default_is_inside_download_dir(self) -> None:
         cfg = AppConfig()
-        cfg.download_dir = r"C:\Загрузки\svsCloud"
-        self.assertEqual(cfg.preview_cache_path, Path(r"C:\Загрузки\svsCloud") / PREVIEW_CACHE_FOLDER)
+        cfg.download_dir = r"C:\Загрузки\НоуКо Cloud"
+        self.assertEqual(cfg.preview_cache_path, Path(r"C:\Загрузки\НоуКо Cloud") / PREVIEW_CACHE_FOLDER)
 
     def test_custom_folder_gets_own_subfolder(self) -> None:
         """Кэш — всегда в отдельной подпапке: очистка не заденет файлы в выбранной папке."""
@@ -58,7 +58,7 @@ class TestUsageAndClear(unittest.TestCase):
             self.assertTrue((d / "sub" / "keep.mp4").exists(), "подпапки не трогаем")
 
     def test_missing_folder(self) -> None:
-        missing = Path(tempfile.gettempdir()) / "svscloud-no-such-dir-xyz"
+        missing = Path(tempfile.gettempdir()) / "noukocloud-no-such-dir-xyz"
         self.assertEqual(cache_usage(missing), (0, 0))
         self.assertEqual(clear_directory(missing), (0, 0))
 

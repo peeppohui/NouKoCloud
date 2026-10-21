@@ -27,12 +27,13 @@ from typing import Optional
 
 import httpx
 
+from ..core.paths import hide_path
 from ..core.config import AppConfig
 from ..core.models import CloudFile, DownloadLink
 from ..net.http_client import HttpClient
 from ..providers.registry import ProviderRegistry
 from .ffmpeg import FfmpegTools
-from .stream_cache import BufferState, CacheError, StreamCache, cache_key, evict
+from .stream_cache import WARM_TAIL, BufferState, CacheError, StreamCache, cache_key, evict
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +58,8 @@ HEADER_TIMEOUT = 15.0
 _RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)$")
 # При этих ответах облака ссылка, скорее всего, протухла — перевыпускаем.
 _STALE_LINK = {401, 403, 404, 410}
+#: Сколько кэшей держать открытыми без сессий (предзагрузка и недавние файлы).
+IDLE_CACHES = 6
 _REASONS = {
     200: "OK", 206: "Partial Content", 400: "Bad Request", 404: "Not Found",
     405: "Method Not Allowed", 416: "Range Not Satisfiable", 502: "Bad Gateway",
@@ -86,10 +89,15 @@ class _RangeSource:
         self._file = file
         self._link: Optional[DownloadLink] = None
         self._direct_url = ""
+        # Облако не отдаёт этот файл по частям (на любой Range — 5xx):
+        # дальше берём файл целиком, по порядку (см. StreamCache._consume_whole).
+        self.no_range = False
 
     async def open(self, start: int, end: int) -> httpx.Response:
         file = self._file
         provider = self._server._registry.get(file.provider)
+        if self.no_range:
+            return await self._open_whole(provider)
         response: httpx.Response | None = None
         for attempt in range(4):
             if response is not None:
@@ -108,13 +116,20 @@ class _RangeSource:
             if via_direct and (status in _STALE_LINK or status >= 500):
                 self._direct_url = ""          # прямой адрес устарел — через ссылку
                 continue
-            if status in _STALE_LINK and attempt < 3:
+            # Протухшая ссылка (403/410…) или сбой узла хранилища (5xx): ссылка
+            # Яндекса привязана к одному узлу, и повтор по ней снова получит 500.
+            # Новая ссылка обычно ведёт на другой, рабочий узел.
+            if (status in _STALE_LINK or status >= 500) and attempt < 3:
                 forget = getattr(provider, "forget_link", None)
                 if forget is not None:
                     forget(file)
                 self._link = None
                 log.info("Превью %s: облако ответило %d — перевыпускаем ссылку", file.name, status)
+                if status >= 500:
+                    await asyncio.sleep(0.5 * (attempt + 1))
                 continue
+            if status >= 500:
+                break           # ссылки перевыпускали — дальше запасной путь ниже
             # Прямой адрес запоминаем только без токена в заголовках: токен
             # нельзя слать на другой домен (httpx и сам его туда не отправляет).
             if response.history and status == 206 and not any(
@@ -123,7 +138,25 @@ class _RangeSource:
                 self._direct_url = str(response.url)
             return response
         assert response is not None
+        if response.status_code >= 500:
+            # И по новым ссылкам части файла не отдаются — так бывает с
+            # отдельными файлами на Яндекс.Диске. Целиком файл при этом
+            # скачивается, поэтому переходим на чтение по порядку.
+            await response.aclose()
+            log.warning("Превью %s: облако не отдаёт файл по частям (%d) — читаем целиком, по порядку",
+                        file.name, response.status_code)
+            self.no_range = True
+            return await self._open_whole(provider)
         return response
+
+    async def _open_whole(self, provider) -> httpx.Response:
+        file = self._file
+        if self._link is None or self._link.is_expired():
+            self._link = await provider.resolve_download(file)
+        headers = {k: v for k, v in self._link.headers.items() if k.lower() != "range"}
+        return await self._server._http.stream(
+            "GET", self._link.url, provider=f"{file.provider.value}-preview", headers=headers,
+        )
 
 
 def media_kind(file: CloudFile) -> str:
@@ -190,6 +223,9 @@ class PreviewServer:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         # Кэши потока по файлу: [кэш, источник, сколько сессий его держат].
         self._caches: dict[str, list] = {}
+        # Кэши без открытых сессий: предзагруженные соседи и недавно
+        # просмотренные файлы — к ним можно вернуться мгновенно. Новые — в конце.
+        self._idle: list[str] = []
 
     # ------------------------------------------------------------------
     @property
@@ -205,6 +241,7 @@ class PreviewServer:
         """Папка кэша превью и облегчённых копий (выбирается в «Настройках»)."""
         path = self._config.preview_cache_path
         path.mkdir(parents=True, exist_ok=True)
+        hide_path(path)     # служебная папка не мешает в папке загрузок
         return path
 
     async def close_caches(self) -> None:
@@ -216,6 +253,7 @@ class PreviewServer:
         for session in self._sessions.values():
             session.cache = None
         entries, self._caches = list(self._caches.values()), {}
+        self._idle.clear()
         for cache, _source, _users in entries:
             await cache.close()
 
@@ -247,6 +285,7 @@ class PreviewServer:
         for cache, _source, _users in list(self._caches.values()):
             await cache.close()
         self._caches.clear()
+        self._idle.clear()
 
     # ------------------------------------------------------------------
     def add_session(self, file: CloudFile) -> PreviewSession:
@@ -295,21 +334,37 @@ class PreviewServer:
     def _cacheable(session: PreviewSession) -> bool:
         return session.file.size > 0 and session.media_kind in ("video", "audio")
 
-    def _attach_cache(self, session: PreviewSession) -> None:
-        if session.cache is not None or session.token not in self._sessions:
-            return
-        file = session.file
-        key = cache_key(file.provider.value, file.source.value, file.file_id, file.path,
-                        file.size, file.md5 or "", file.modified_ts)
+    @staticmethod
+    def _file_key(file: CloudFile) -> str:
+        return cache_key(file.provider.value, file.source.value, file.file_id, file.path,
+                         file.size, file.md5 or "", file.modified_ts)
+
+    def _entry_for(self, file: CloudFile, warm: bool) -> list:
+        key = self._file_key(file)
         entry = self._caches.get(key)
         if entry is None:
             budget = int(max(0.5, float(self._config.preview_cache_gb)) * 1024 ** 3)
             evict(self.cache_dir, keep=set(self._caches) | {key}, budget_bytes=budget)
             source = _RangeSource(self, file)
             cache = StreamCache(key, file.size, self.cache_dir, source.open, name=file.name)
+            if warm:
+                cache.set_warm(True)
+                cache.tail_limit = WARM_TAIL
             cache.open()
             entry = [cache, source, 0]
             self._caches[key] = entry
+            if warm:
+                self._idle.append(key)
+                self._trim_idle()
+        return entry
+
+    def _attach_cache(self, session: PreviewSession) -> None:
+        if session.cache is not None or session.token not in self._sessions:
+            return
+        entry = self._entry_for(session.file, warm=False)
+        if entry[0].key in self._idle:
+            self._idle.remove(entry[0].key)
+        entry[0].set_warm(False)
         entry[2] += 1
         session.cache = entry[0]
 
@@ -322,8 +377,43 @@ class PreviewServer:
             return
         entry[2] -= 1
         if entry[2] <= 0:
-            del self._caches[cache.key]
-            asyncio.ensure_future(cache.close())
+            # Не закрываем сразу: к недавнему файлу часто возвращаются.
+            # Качать дальше «про запас» ему незачем — только немного.
+            cache.set_warm(True)
+            self._idle.append(cache.key)
+            self._trim_idle()
+
+    def _trim_idle(self) -> None:
+        while len(self._idle) > IDLE_CACHES:
+            key = self._idle.pop(0)
+            entry = self._caches.get(key)
+            if entry is not None and entry[2] <= 0:
+                del self._caches[key]
+                asyncio.ensure_future(entry[0].close())
+
+    def warm(self, files: list[CloudFile]) -> None:
+        """Заранее готовит превью: ссылка, прямой адрес хранилища, начало файла.
+
+        Вызывается из GUI-потока для соседей выбранного файла и файла под мышью.
+        """
+        if self._loop is None or self._loop.is_closed():
+            return
+        wanted = [f for f in files if f.size > 0 and media_kind(f) in ("video", "audio")]
+        if wanted:
+            self._loop.call_soon_threadsafe(self._warm_now, wanted[:IDLE_CACHES])
+
+    def _warm_now(self, files: list[CloudFile]) -> None:
+        for file in files:
+            try:
+                key = self._file_key(file)
+                if key in self._caches:
+                    if key in self._idle:          # освежаем место в очереди
+                        self._idle.remove(key)
+                        self._idle.append(key)
+                    continue
+                self._entry_for(file, warm=True)
+            except Exception:
+                log.debug("Предзагрузка %s не удалась", file.name, exc_info=True)
 
     def media_url(self, token: str) -> str:
         return f"{self.base_url}/media/{token}"

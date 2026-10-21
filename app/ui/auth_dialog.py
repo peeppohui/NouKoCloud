@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -21,74 +22,81 @@ from PySide6.QtWidgets import (
 from ..core.errors import friendly_error
 from ..core.models import ProviderId
 from ..oauth.yandex import normalize_code
+from . import theme
+from .widgets import IconLabel, OverlayDialog, button, label, set_prop
 
 log = logging.getLogger(__name__)
 
 
-class AuthDialog(QDialog):
+class AuthDialog(OverlayDialog):
     """Два понятных действия: «Войти через Яндекс» и «Войти через Google»."""
 
     login_succeeded = Signal(str, str)   # provider id, имя аккаунта
     login_failed = Signal(str, str)      # provider id, сообщение
 
     def __init__(self, oauth, runtime, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
+        super().__init__("вход в аккаунты", parent, max_width=580)
         self._oauth = oauth
         self._runtime = runtime
         self.setWindowTitle("Вход в облачные аккаунты")
-        self.setMinimumWidth(560)
+        body = self.body_layout
+        body.setSpacing(18)
 
-        layout = QVBoxLayout(self)
-        layout.setSpacing(14)
-
-        intro = QLabel(
-            "Войдите в свой Яндекс.Диск и Google Диск, чтобы видеть «Мой диск».\n"
+        body.addWidget(label(
+            "Войдите в свой Яндекс.Диск и Google Диск, чтобы видеть «Мой диск». "
             "Публичные ссылки работают и без входа — их можно вставить сразу.",
-            self,
-        )
-        intro.setProperty("muted", True)
-        intro.setWordWrap(True)
-        layout.addWidget(intro)
+            "muted", self.body, wrap=True))
 
-        self._yandex_status = self._make_account_block(
-            layout, "Яндекс.Диск", ProviderId.YANDEX,
-            "После входа браузер покажет код — вставьте его в поле ниже.",
-        )
-        self._google_status = self._make_account_block(
-            layout, "Google Диск", ProviderId.GOOGLE,
-            "Вход откроется в браузере и вернётся обратно в программу.",
-        )
+        # --- Яндекс ---
+        yandex_card, yandex_lay, self._yandex_status = self._account_card(
+            "Яндекс.Диск", "После входа браузер покажет код — вставьте его в поле ниже.")
+        self._yandex_link = QLabel("", yandex_card)
+        self._yandex_link.setOpenExternalLinks(True)
+        self._yandex_link.setTextFormat(Qt.TextFormat.RichText)
+        self._yandex_link.setVisible(False)
+        yandex_lay.addWidget(self._yandex_link)
 
-        self._yandex_code = QLineEdit(self)
+        self._yandex_code = QLineEdit(yandex_card)
+        self._yandex_code.setProperty("variant", "l")
         self._yandex_code.setPlaceholderText("Вставьте код со страницы Яндекса и нажмите Enter")
+        self._yandex_code.setAccessibleName("Код со страницы Яндекса")
         self._yandex_code.setVisible(False)
         # Подключаем один раз: иначе каждое нажатие «Войти» добавляло бы
         # ещё один обработчик, и код уходил бы в Яндекс несколько раз.
         self._yandex_code.returnPressed.connect(self._finish_yandex)
-        layout.addWidget(self._yandex_code)
+        yandex_lay.addWidget(self._yandex_code)
 
-        self._yandex_link = QLabel("", self)
-        self._yandex_link.setOpenExternalLinks(True)
-        self._yandex_link.setTextFormat(Qt.TextFormat.RichText)
-        self._yandex_link.setVisible(False)
-        layout.addWidget(self._yandex_link)
-
-        buttons = QHBoxLayout()
-        self._yandex_btn = QPushButton("Войти через Яндекс.Диск", self)
+        yandex_row = QHBoxLayout()
+        yandex_row.setSpacing(12)
+        self._yandex_btn = button("Войти через Яндекс.Диск", "primary", yandex_card, size="m")
         self._yandex_btn.clicked.connect(self._login_yandex)
-        self._google_btn = QPushButton("Войти через Google Диск", self)
-        self._google_btn.clicked.connect(self._login_google)
-        buttons.addWidget(self._yandex_btn)
-        buttons.addWidget(self._google_btn)
-        buttons.addStretch(1)
-        close_btn = QPushButton("Закрыть", self)
-        close_btn.clicked.connect(self.accept)
-        buttons.addWidget(close_btn)
-        layout.addLayout(buttons)
+        yandex_row.addWidget(self._yandex_btn)
+        yandex_row.addStretch(1)
+        yandex_lay.addLayout(yandex_row)
+        body.addWidget(yandex_card)
 
-        self._status = QLabel("", self)
+        # --- Google ---
+        google_card, google_lay, self._google_status = self._account_card(
+            "Google Диск", "Вход откроется в браузере и вернётся обратно в программу.")
+        google_row = QHBoxLayout()
+        self._google_btn = button("Войти через Google Диск", "outline", google_card)
+        self._google_btn.clicked.connect(self._login_google)
+        google_row.addWidget(self._google_btn)
+        google_row.addStretch(1)
+        google_lay.addLayout(google_row)
+        body.addWidget(google_card)
+
+        self._status = QLabel("", self.body)
         self._status.setWordWrap(True)
-        layout.addWidget(self._status)
+        self._status.setProperty("role", "muted")
+        body.addWidget(self._status)
+
+        guide_btn = button("Инструкция: где взять ключи", "link", self.card)
+        guide_btn.clicked.connect(self._show_guide)
+        self.footer.insertWidget(0, guide_btn)
+        close_btn = button("Закрыть", "outline", self.card, size="plain")
+        close_btn.clicked.connect(self.accept)
+        self.footer.addWidget(close_btn)
 
         # Сигналы испускаются из фонового потока — Qt доставит их в GUI-поток.
         self.login_succeeded.connect(self._on_login_succeeded)
@@ -96,26 +104,50 @@ class AuthDialog(QDialog):
         self._refresh()
 
     # ------------------------------------------------------------------
-    def _make_account_block(self, layout, title: str, pid: ProviderId, hint: str) -> QLabel:
-        box = QLabel(self)
-        box.setTextFormat(Qt.TextFormat.RichText)
-        layout.addWidget(box)
-        box.setProperty("hint", hint)
-        box.setProperty("pid", pid.value)
-        return box
+    def _account_card(self, title: str, hint: str):
+        card = QFrame(self.body)
+        card.setProperty("card", True)
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(18, 18, 18, 18)
+        lay.setSpacing(14)
+        head = QHBoxLayout()
+        head.setSpacing(12)
+        avatar = QLabel(card)
+        avatar.setProperty("avatar", True)
+        avatar.setFixedSize(40, 40)
+        av = QHBoxLayout(avatar)
+        av.setContentsMargins(0, 0, 0, 0)
+        av.addWidget(IconLabel("cloud", "text", 20, avatar), 0, Qt.AlignmentFlag.AlignCenter)
+        head.addWidget(avatar)
+        name = label(title, "wide", card)
+        name.setStyleSheet("font-size: 15px;")
+        head.addWidget(name)
+        head.addStretch(1)
+        status = QLabel("", card)
+        status.setProperty("chip", "muted")
+        head.addWidget(status)
+        lay.addLayout(head)
+        lay.addWidget(label(hint, "muted", card, wrap=True))
+        return card, lay, status
+
+    def _show_guide(self) -> None:
+        from .help_dialog import HelpDialog
+
+        HelpDialog(self.parentWidget() or self).exec()
 
     def _refresh(self) -> None:
-        for block, pid in ((self._yandex_status, ProviderId.YANDEX), (self._google_status, ProviderId.GOOGLE)):
+        for chip, pid in ((self._yandex_status, ProviderId.YANDEX), (self._google_status, ProviderId.GOOGLE)):
             name = self._oauth.account_name(pid)
             if self._oauth.is_logged_in(pid):
-                block.setText(f"<b>{self._oauth.provider(pid).display_name}</b>: <span style='color:#1e8e5a'>вы вошли как {name or 'аккаунт'}</span>")
+                chip.setText(f"✓  вы вошли как {name or 'аккаунт'}")
+                set_prop(chip, "chip", "ok")
             elif not self._oauth.configured(pid):
-                block.setText(
-                    f"<b>{self._oauth.provider(pid).display_name}</b>: "
-                    "<span style='color:#c0392b'>не задан ключ приложения — см. «Настройки»</span>"
-                )
+                chip.setText("нужен ключ — см. «Настройки»")
+                chip.setToolTip("Впишите Client ID и Client Secret в «Настройках»")
+                set_prop(chip, "chip", "err")
             else:
-                block.setText(f"<b>{self._oauth.provider(pid).display_name}</b>: <span style='color:#6b7480'>не выполнен вход</span>")
+                chip.setText("не выполнен вход")
+                set_prop(chip, "chip", "muted")
 
     # ------------------------------------------------------------------
     def _login_yandex(self) -> None:
@@ -127,7 +159,9 @@ class AuthDialog(QDialog):
 
         # Открываем страницу авторизации: Яндекс покажет код подтверждения.
         url = self._oauth.auth_url(ProviderId.YANDEX)
-        self._yandex_link.setText(f'<a href="{url}">Открыть страницу авторизации Яндекса</a>')
+        color = theme.current().text
+        self._yandex_link.setText(
+            f'<a href="{url}" style="color:{color}">Открыть страницу авторизации Яндекса</a>')
         self._yandex_link.setVisible(True)
         QDesktopServices.openUrl(QUrl(url))
 
@@ -194,7 +228,7 @@ class AuthDialog(QDialog):
         try:
             name = future.result()
         except Exception as exc:
-            log.warning("Вход не удался: %s", exc)
+            log.warning("Вход не удался: %s", exc, exc_info=True)
             self.login_failed.emit(pid.value, friendly_error(exc))
         else:
             self.login_succeeded.emit(pid.value, name)

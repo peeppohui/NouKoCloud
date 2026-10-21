@@ -130,6 +130,10 @@ class Segment:
         return min(100, int(self.received * 100 / max(1, self.total)))
 
 
+#: Служебная (скрытая) папка недокачанных файлов внутри папки загрузок.
+PARTS_DIR = ".noukocloud-parts"
+
+
 @dataclass(slots=True)
 class DownloadJob:
     """Задание на скачивание одного файла."""
@@ -162,12 +166,18 @@ class DownloadJob:
         return min(100, int(self.downloaded_bytes * 100 / self.total_bytes))
 
     @property
+    def parts_dir(self) -> Path:
+        """Скрытая папка для недокачанного: в папке загрузок появляется
+        сразу готовый файл, без «.part» рядом."""
+        return self.dest_dir / PARTS_DIR
+
+    @property
     def part_path(self) -> Path:
-        return self.dest_dir / f"{self.file.name}.part"
+        return self.parts_dir / f"{self.file.name}.part"
 
     @property
     def state_path(self) -> Path:
-        return self.dest_dir / f"{self.file.name}.part.json"
+        return self.parts_dir / f"{self.file.name}.part.json"
 
     @property
     def final_path(self) -> Path:

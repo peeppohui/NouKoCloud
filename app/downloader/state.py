@@ -69,6 +69,7 @@ def save_state(job: DownloadJob) -> None:
     path = job.state_path
     tmp = path.with_suffix(".json.tmp")
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, path)
     except OSError as exc:

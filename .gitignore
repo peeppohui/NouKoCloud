@@ -26,7 +26,7 @@ cache.db
 *.log
 
 # Кэш превью программы
-.svscloud-preview/
+.noukocloud-preview/
 
 # IDE и ОС
 .idea/
@@ -37,5 +37,5 @@ Thumbs.db
 desktop.ini
 
 # Собранная программа в корне (кладётся после сборки)
-/svsCloud.exe
+/NoukoCloud.exe
 /_internal/

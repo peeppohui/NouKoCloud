@@ -25,12 +25,14 @@ FALLBACKS = (
     "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
 )
 
-WANTED = ("ffmpeg.exe", "ffprobe.exe")
+WANTED = ("ffmpeg.exe",)          # ffprobe программе не нужен
+#: Лицензия ffmpeg кладётся рядом: распространять сборку можно только вместе с ней.
+LICENSE_NAMES = ("LICENSE", "LICENSE.txt", "COPYING.GPLv3", "COPYING.GPLv3.txt")
 
 
 def download(url: str, target: Path) -> None:
     print(f"Качаем {url}")
-    request = urllib.request.Request(url, headers={"User-Agent": "svsCloud/0.1"})
+    request = urllib.request.Request(url, headers={"User-Agent": "NoukoCloud/0.1"})
     with urllib.request.urlopen(request, timeout=120) as response:
         total = int(response.headers.get("Content-Length") or 0)
         done = 0
@@ -57,6 +59,17 @@ def extract(archive: Path) -> int:
                     shutil.copyfileobj(source, target)
                 print(f"  распакован bin/{name}")
                 found += 1
+            elif name in LICENSE_NAMES and not (TARGET_DIR / "LICENSE-ffmpeg.txt").exists():
+                with bundle.open(member) as source, open(TARGET_DIR / "LICENSE-ffmpeg.txt", "wb") as target:
+                    shutil.copyfileobj(source, target)
+                print("  распакована лицензия ffmpeg")
+    (TARGET_DIR / "README-ffmpeg.txt").write_text(
+        "ffmpeg — свободная программа (https://ffmpeg.org), в составе НоуКо Cloud\n"
+        "используется без изменений для превью редких форматов.\n"
+        "Лицензия — LICENSE-ffmpeg.txt. Исходный код: https://ffmpeg.org/download.html\n"
+        "Сборка для Windows: https://www.gyan.dev/ffmpeg/builds/\n",
+        encoding="utf-8",
+    )
     return found
 
 

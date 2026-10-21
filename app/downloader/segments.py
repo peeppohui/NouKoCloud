@@ -11,18 +11,26 @@ log = logging.getLogger(__name__)
 MB = 1024 * 1024
 
 
-def plan_segments(total: int, *, segment_size_mb: int, max_segments: int = 16) -> list[Segment]:
-    """Делит файл на куски примерно по segment_size_mb.
+#: Больше частей не нарезаем: у файла в 10 ГБ части станут крупнее 4 МБ.
+MAX_SEGMENTS = 512
 
-    Маленькие файлы (< 2 сегментов) не делим — оверхед не окупается.
+
+def plan_segments(total: int, *, segment_size_mb: int, max_segments: int = MAX_SEGMENTS) -> list[Segment]:
+    """Делит файл на части примерно по segment_size_mb.
+
+    Частей обычно больше, чем одновременных соединений: загрузчик держит
+    очередь и качает их по N штук (Transfer._run_parallel). Так соединения
+    не простаивают до самого конца файла: облако (особенно Яндекс) режет
+    скорость каждого соединения, и всё решает их число.
+    Файл не больше одной части не делим.
     """
     if total <= 0:
         return []
     chunk = max(1, segment_size_mb) * MB
-    if total <= chunk * 2:
+    if total <= chunk:
         return [Segment(index=0, start=0, end=total - 1)]
 
-    count = min(max_segments, max(2, total // chunk))
+    count = min(max(2, max_segments), -(-total // chunk))
     # Раскладываем остаток на последний сегмент, чтобы сумма совпала с total.
     base = total // count
     segments: list[Segment] = []

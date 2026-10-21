@@ -18,10 +18,24 @@ log = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
+def _log_loop_exception(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    """Ошибка в фоновой задаче, которую никто не дождался, — в журнал ошибок."""
+    exc = context.get("exception")
+    message = context.get("message", "ошибка в фоновой задаче")
+    if isinstance(exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+        # Плеер закрыл соединение (перемотка, другой файл) — это не ошибка.
+        log.debug("Фоновый цикл: соединение закрыто другой стороной (%s)", message)
+        return
+    task = context.get("task") or context.get("future")
+    where = f" ({task.get_name()})" if task is not None and hasattr(task, "get_name") else ""
+    log.error("Фоновый цикл: %s%s", message, where,
+              exc_info=(type(exc), exc, exc.__traceback__) if exc else None)
+
+
 class AsyncRuntime:
     """Держит event loop в отдельном потоке."""
 
-    def __init__(self, name: str = "svscloud-io") -> None:
+    def __init__(self, name: str = "noukocloud-io") -> None:
         self._name = name
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -41,6 +55,7 @@ class AsyncRuntime:
     def _run(self) -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        loop.set_exception_handler(_log_loop_exception)
         self._loop = loop
         self._ready.set()
         try:

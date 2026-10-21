@@ -1,4 +1,4 @@
-# svsCloud — архитектура
+# НоуКо Cloud — архитектура
 
 Утилита для монтажёров: открыть папку на Яндекс.Диске или Google Диске
 (свою или по чужой ссылке), посмотреть превью, отметить нужное и скачать
@@ -49,7 +49,7 @@ SQLite (кэш) / PyInstaller (сборка). Зависимостей ровн�
 |---|---|---|
 | Ядро | `app/core/models.py` | `CloudFile`, `DownloadJob`, `Segment`, `DownloadLink` — общий язык всех слоёв |
 | Ядро | `app/core/errors.py` | Единая точка превращения исключений в **человеческие** фразы для UI |
-| Ядро | `app/core/config.py` | Настройки в `%APPDATA%\svsCloud\config.json`, переопределение через env |
+| Ядро | `app/core/config.py` | Настройки в `%APPDATA%\NoukoCloud\config.json`, переопределение через env |
 | Ядро | `app/core/secrets_store.py` | Токены, зашифрованные DPAPI (привязка к пользователю Windows) |
 | Ядро | `app/core/async_runtime.py` | Event loop в отдельном потоке + `run_coroutine_threadsafe` |
 | Ядро | `app/core/bus.py` | Шина сигналов Qt между потоками |
@@ -84,7 +84,7 @@ SQLite (кэш) / PyInstaller (сборка). Зависимостей ровн�
 * **Google** — тип «Desktop app»: приложение поднимает `127.0.0.1:<случайный порт>`,
   открывает системный браузер, Google возвращает код на `http://127.0.0.1:PORT/`.
   Пользователю ничего делать не нужно.
-* Токены живут в `%APPDATA%\svsCloud\tokens.dat`, зашифрованы DPAPI.
+* Токены живут в `%APPDATA%\NoukoCloud\tokens.dat`, зашифрованы DPAPI.
 * `OAuthManager.access_token()` сам обновляет токен за 2 минуты до истечения;
   при неудаче refresh — просит войти заново.
 * Для Яндекса передаётся `device_id` — в настройках Яндекс ID видно,
@@ -285,7 +285,7 @@ engine.enqueue(files)
 > а не `QStandardItem`; у `QStandardItem` нет `setExpanded`). Такие ошибки
 > не ловятся ни тестами провайдера, ни моками API — поэтому добавлены
 > headless-тесты интерфейса (`tests/test_ui_tree.py`) и запуск со ссылкой
-> из командной строки: `svsCloud.exe --open https://disk.yandex.ru/d/KEY`.
+> из командной строки: `NoukoCloud.exe --open https://disk.yandex.ru/d/KEY`.
 
 ---
 
@@ -295,13 +295,13 @@ engine.enqueue(files)
 python -m pip install -r requirements.txt
 python run.py                       # разработка
 python -m unittest discover -s tests -t .   # тесты
-powershell packaging\build.ps1       # сборка dist\svsCloud.exe
+powershell packaging\build.ps1       # сборка dist\NoukoCloud.exe
 ```
 
 Собранный `.exe` хранит настройки, токены и журналы в
-`%APPDATA%\svsCloud\`. Ключи приложений вводятся монтажёром в
+`%APPDATA%\NoukoCloud\`. Ключи приложений вводятся монтажёром в
 «Настройках» или поставляются централизованно через переменные окружения
-`SVSCLOUD_YANDEX_CLIENT_ID` / `SVSCLOUD_GOOGLE_CLIENT_ID` и т. д.
+`NOUKOCLOUD_YANDEX_CLIENT_ID` / `NOUKOCLOUD_GOOGLE_CLIENT_ID` и т. д.
 
 ---
 

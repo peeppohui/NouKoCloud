@@ -14,13 +14,14 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QModelIndex, Qt, Signal
+from PySide6.QtCore import QModelIndex, QSize, Qt, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QKeySequence, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMenu,
     QPushButton,
+    QSizePolicy,
     QTreeView,
     QVBoxLayout,
     QWidget,
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
 
 from ..core.models import CloudFile, EntryKind, ProviderId, SourceKind
 from ..providers.base import BrowseContext
+from . import theme
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +40,30 @@ IS_DIR_ROLE = Qt.ItemDataRole.UserRole + 3
 GROUP_ROLE = Qt.ItemDataRole.UserRole + 4        # раздел облака: значение ProviderId
 HINT_ROLE = Qt.ItemDataRole.UserRole + 5         # служебная строка («загрузка…», подсказка)
 DRIVE_ROLE = Qt.ItemDataRole.UserRole + 6        # постоянный «Мой диск»: значение ProviderId
+ICON_ROLE = Qt.ItemDataRole.UserRole + 7         # (иконка, цвет палитры) — перекраска при смене темы
+
+HEADER_LABELS = ["ФАЙЛ", "РАЗМЕР", "ИЗМЕНЁН"]
+
+VIDEO_EXT = (".mp4", ".mov", ".mkv", ".avi", ".mxf", ".mts", ".m2ts", ".webm", ".m4v",
+             ".mpg", ".mpeg", ".wmv", ".flv", ".r3d", ".braw", ".3gp")
+AUDIO_EXT = (".wav", ".mp3", ".flac", ".aac", ".m4a", ".ogg", ".opus", ".wma", ".aif", ".aiff")
+IMAGE_EXT = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff", ".heic",
+             ".dng", ".cr2", ".cr3", ".nef", ".arw", ".psd")
+
+
+def file_icon_name(file: CloudFile) -> str:
+    """Иконка строки: папка, видео, звук, картинка или документ."""
+    if file.kind is EntryKind.FOLDER:
+        return "folder"
+    name = file.name.lower()
+    mime = (file.mime or "").lower()
+    if mime.startswith("video/") or name.endswith(VIDEO_EXT):
+        return "video"
+    if mime.startswith("audio/") or name.endswith(AUDIO_EXT):
+        return "audio"
+    if mime.startswith("image/") or name.endswith(IMAGE_EXT):
+        return "image"
+    return "doc"
 
 #: Разделы дерева — в этом порядке.
 GROUPS: tuple[tuple[ProviderId, str], ...] = (
@@ -46,28 +72,6 @@ GROUPS: tuple[tuple[ProviderId, str], ...] = (
 )
 MY_DRIVE = "Мой диск"
 DRIVE_HINT = "раскройте, чтобы загрузить"
-
-
-ICONS_DIR = Path(__file__).resolve().parent / "icons"
-
-
-def _indicator_stylesheet() -> str:
-    """Чекбоксы дерева: всегда видимая рамка, отмеченный — синий с галочкой."""
-    check = (ICONS_DIR / "check.svg").as_posix()
-    dash = (ICONS_DIR / "dash.svg").as_posix()
-    return f"""
-    QTreeView::indicator {{
-        width: 15px; height: 15px;
-        border: 1.5px solid #8f98a3; border-radius: 4px; background: #ffffff;
-    }}
-    QTreeView::indicator:hover {{ border-color: #2f6fed; }}
-    QTreeView::indicator:checked {{
-        background: #2f6fed; border-color: #2f6fed; image: url("{check}");
-    }}
-    QTreeView::indicator:indeterminate {{
-        background: #2f6fed; border-color: #2f6fed; image: url("{dash}");
-    }}
-    """
 
 
 def human_size(size: int) -> str:
@@ -187,6 +191,8 @@ class FileTree(QWidget):
 
     file_activated = Signal(object)      # CloudFile: двойной клик или Enter
     file_selected = Signal(object)       # CloudFile: курсор встал на файл (клик, стрелки)
+    file_hovered = Signal(object)        # CloudFile: мышь над файлом или папкой (предзагрузка)
+    folder_hovered = Signal(object, object)  # CloudFile, BrowseContext: мышь над папкой
     checked_changed = Signal(int)        # количество отмеченных
     children_loaded = Signal(int, object)  # token, list[CloudFile]
     open_drive_requested = Signal(object)  # ProviderId: раскрыли/обновили «Мой диск»
@@ -195,7 +201,7 @@ class FileTree(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._model = TreeModel(self)
-        self._model.setHorizontalHeaderLabels(["Файл", "Размер", "Изменён"])
+        self._model.setHorizontalHeaderLabels(HEADER_LABELS)
         self._counter = 0
         self._pending: dict[int, QStandardItem] = {}   # token -> родительская папка
         self._no_autoload = False
@@ -204,16 +210,23 @@ class FileTree(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setSpacing(6)
 
         top = QHBoxLayout()
-        top.setSpacing(8)
-        self._title = QLabel("Файлы", self)
-        self._title.setProperty("heading", True)
-        top.addWidget(self._title)
-        top.addStretch(1)
+        top.setContentsMargins(20, 20, 20, 10)
+        top.setSpacing(14)
+        self._title = QLabel("исходники", self)
+        self._title.setProperty("role", "h3")
+        top.addWidget(self._title, 0, Qt.AlignmentFlag.AlignBottom)
+        self._subtitle = QLabel("", self)
+        self._subtitle.setProperty("muted", True)
+        self._subtitle.setMinimumWidth(20)
+        self._subtitle.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        top.addWidget(self._subtitle, 1, Qt.AlignmentFlag.AlignBottom)
         self._btn_all = QPushButton("Отметить всё", self)
         self._btn_none = QPushButton("Снять всё", self)
+        for btn in (self._btn_all, self._btn_none):
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_all.clicked.connect(lambda: self._set_all_checked(True))
         self._btn_none.clicked.connect(lambda: self._set_all_checked(False))
         top.addWidget(self._btn_all)
@@ -221,18 +234,19 @@ class FileTree(QWidget):
         layout.addLayout(top)
 
         self._view = QTreeView(self)
-        # В стиле Windows 11 вместе с нашей темой пустые чекбоксы в дереве не
-        # рисуются вовсе (видна только галочка у отмеченного) — непонятно, куда
-        # нажимать. Рисуем флажки сами: рамка, синий фон, белая галочка.
-        self._view.setStyleSheet(_indicator_stylesheet())
+        # Флажки рисует тема (theme.stylesheet): в стиле Windows 11 пустые
+        # флажки в дереве иначе не видны вовсе — непонятно, куда нажимать.
         self._view.setModel(self._model)
+        self._view.setIconSize(QSize(18, 18))
+        self._view.setIndentation(22)
         self._view.setHeaderHidden(False)
         self._view.setAlternatingRowColors(False)
         self._view.setUniformRowHeights(True)
         self._view.setSelectionMode(QTreeView.SelectionMode.ExtendedSelection)
         self._view.setColumnWidth(0, 330)
-        self._view.setColumnWidth(1, 90)
-        self._view.setColumnWidth(2, 130)
+        self._view.setColumnWidth(1, 96)
+        self._view.setColumnWidth(2, 132)
+        self._view.header().setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         # Сортировку делаем сами (см. TreeModel): штатная QStandardItemModel
         # сравнивает колонки как строки, и «10 МБ» встало бы раньше «9 МБ».
         # Сортировку view выключена, но стрелку в заголовке показываем.
@@ -244,6 +258,9 @@ class FileTree(QWidget):
         # activated — двойной клик и Enter (на Windows).
         self._view.activated.connect(self._on_double_clicked)
         self._view.selectionModel().currentChanged.connect(self._on_current_changed)
+        # Мышь над файлом — сигнал для предзагрузки превью (без клика).
+        self._view.setMouseTracking(True)
+        self._view.entered.connect(self._on_entered)
         self._model.itemChanged.connect(self._on_item_changed)
         self._view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._view.customContextMenuRequested.connect(self._show_context_menu)
@@ -255,6 +272,36 @@ class FileTree(QWidget):
         layout.addWidget(self._view, 1)
 
         self._build_groups()
+        theme.manager().changed.connect(self._retheme)
+
+    def set_subtitle(self, text: str) -> None:
+        """Подпись рядом с заголовком: что открыто последним."""
+        self._subtitle.setText(text)
+        self._subtitle.setToolTip(text)
+
+    # --- иконки и цвета темы ---------------------------------------------
+    @staticmethod
+    def _set_icon(item: QStandardItem, name: str, role: str = "text") -> None:
+        item.setData((name, role), ICON_ROLE)
+        palette = theme.current()
+        item.setIcon(theme.icon(name, getattr(palette, role), 18))
+
+    def _retheme(self, palette) -> None:
+        def walk(item: QStandardItem) -> None:
+            spec = item.data(ICON_ROLE)
+            if spec:
+                item.setIcon(theme.icon(spec[0], getattr(palette, spec[1]), 18))
+            if item.data(HINT_ROLE):
+                item.setForeground(QBrush(theme.qcolor(palette.muted)))
+            for row in range(item.rowCount()):
+                child = item.child(row)
+                if child is not None:
+                    walk(child)
+
+        for row in range(self._model.rowCount()):
+            top = self._model.item(row)
+            if top is not None:
+                walk(top)
 
     # ------------------------------------------------------------------
     # Разделы «Яндекс.Диск» / «Google Диск»
@@ -270,7 +317,7 @@ class FileTree(QWidget):
             font = group.font()
             font.setBold(True)
             group.setFont(font)
-            group.setIcon(self._standard_icon("SP_DriveNetIcon"))
+            self._set_icon(group, "cloud")
             self._model.appendRow(group)
             # Заголовок раздела — на всю ширину, без колонок «Размер»/«Изменён».
             self._view.setFirstColumnSpanned(group.row(), QModelIndex(), True)
@@ -286,7 +333,7 @@ class FileTree(QWidget):
         drive.setData(BrowseContext(source=SourceKind.OAUTH, root_path="/", display_name=MY_DRIVE),
                       CTX_ROLE)
         drive.setData(False, LOADED_ROLE)
-        drive.setIcon(self._standard_icon("SP_DriveHDIcon"))
+        self._set_icon(drive, "drive")
         drive.setToolTip(f"Ваш {group.text()}: раскройте, чтобы загрузить; правый клик — обновить")
         group.appendRow(drive)
         self._set_hint(drive, DRIVE_HINT)
@@ -301,7 +348,7 @@ class FileTree(QWidget):
         hint.setEditable(False)
         hint.setSelectable(False)
         hint.setData(True, HINT_ROLE)
-        hint.setForeground(QBrush(QColor("#8a929c")))
+        hint.setForeground(QBrush(theme.qcolor(theme.current().muted)))
         item.appendRow(hint)
 
     def group(self, pid: ProviderId) -> QStandardItem:
@@ -413,7 +460,7 @@ class FileTree(QWidget):
             root.setToolTip(f"Открыто по ссылке: {ctx.public_key}")
         root.setData(ctx, CTX_ROLE)
         root.setData(True, LOADED_ROLE)
-        root.setIcon(self._icon_for_folder())
+        self._set_icon(root, "link")
         if parent is None:
             self._model.appendRow(root)
         else:
@@ -447,7 +494,7 @@ class FileTree(QWidget):
 
     def clear(self) -> None:
         self._model.clear()
-        self._model.setHorizontalHeaderLabels(["Файл", "Размер", "Изменён"])
+        self._model.setHorizontalHeaderLabels(HEADER_LABELS)
         self._pending.clear()
         self._build_groups()
 
@@ -491,6 +538,8 @@ class FileTree(QWidget):
         name = QStandardItem(file.name)
         name.setEditable(False)
         name.setData(file, FILE_ROLE)
+        icon_name = file_icon_name(file)
+        self._set_icon(name, icon_name, "text" if icon_name == "folder" else "muted")
         name.setData(ctx, CTX_ROLE)
         name.setData(False, LOADED_ROLE)
         name.setData(file.kind is EntryKind.FOLDER, IS_DIR_ROLE)
@@ -620,6 +669,34 @@ class FileTree(QWidget):
         if isinstance(file, CloudFile) and file.is_file:
             self.file_activated.emit(file)
 
+    def _on_entered(self, index) -> None:
+        item = self._model.itemFromIndex(index.siblingAtColumn(0)) if index.isValid() else None
+        file = item.data(FILE_ROLE) if item is not None else None
+        if isinstance(file, CloudFile) and file.is_file:
+            self.file_hovered.emit(file)
+        elif isinstance(file, CloudFile) and not item.data(LOADED_ROLE):
+            ctx = item.data(CTX_ROLE)
+            if isinstance(ctx, BrowseContext):
+                self.folder_hovered.emit(file, ctx)
+
+    def neighbor_files(self, count: int = 2) -> list[CloudFile]:
+        """Файлы рядом с текущим (ниже, затем выше) — их, скорее всего, откроют следующими."""
+        index = self._view.currentIndex()
+        item = self._model.itemFromIndex(index.siblingAtColumn(0)) if index.isValid() else None
+        if item is None:
+            return []
+        parent = item.parent() or self._model.invisibleRootItem()
+        row = item.row()
+        result: list[CloudFile] = []
+        for step in range(1, count + 1):
+            for r in (row + step, row - step):
+                if 0 <= r < parent.rowCount():
+                    child = parent.child(r)
+                    file = child.data(FILE_ROLE) if child is not None else None
+                    if isinstance(file, CloudFile) and file.is_file:
+                        result.append(file)
+        return result
+
     def current_file(self) -> Optional[CloudFile]:
         """Файл под курсором (или None, если курсор на папке / пусто)."""
         index = self._view.currentIndex()
@@ -711,6 +788,39 @@ class FileTree(QWidget):
                 result.append(file)
         for row in range(item.rowCount()):
             self._collect(item.child(row), result)
+
+    def checked_downloads(self) -> list[tuple[CloudFile, tuple[str, ...]]]:
+        """Отмеченные файлы и папки, в которые их класть.
+
+        Отмечена папка целиком — она скачается папкой: файлы внутри неё (и во
+        вложенных папках) получают путь от неё, например ("Камера A", "День 1").
+        Отдельно отмеченные файлы — путь пустой: прямо в папку загрузок.
+        """
+        result: list[tuple[CloudFile, tuple[str, ...]]] = []
+        for row in range(self._model.rowCount()):
+            self._collect_dirs(self._model.item(row), (), False, result)
+        return result
+
+    def _collect_dirs(self, item: QStandardItem, path: tuple[str, ...], inside: bool,
+                      result: list) -> None:
+        file = item.data(FILE_ROLE)
+        if isinstance(file, CloudFile):
+            checked = item.checkState() == Qt.CheckState.Checked
+            if file.is_file:
+                if checked:
+                    result.append((file, path if inside else ()))
+                return
+            if checked or inside:
+                # Папка отмечена целиком (или лежит в такой) — она станет папкой на диске.
+                path, inside = path + (file.name,), True
+        for row in range(item.rowCount()):
+            child = item.child(row)
+            if child is not None:
+                self._collect_dirs(child, path, inside, result)
+
+    def loading(self) -> bool:
+        """Какие-то папки ещё подгружаются (список отмеченного может быть неполным)."""
+        return bool(self._pending)
 
     def visible_files(self) -> list[CloudFile]:
         """Все файлы в дереве (для «отметить всё»)."""

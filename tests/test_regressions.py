@@ -339,6 +339,7 @@ class TestCancel(unittest.IsolatedAsyncioTestCase):
             file = CloudFile(provider=ProviderId.YANDEX, file_id="1", path="/a.mp4", name="a.mp4",
                              kind=EntryKind.FILE, size=100, source=SourceKind.PUBLIC)
             job = DownloadJob(file=file, dest_dir=dest)
+            job.parts_dir.mkdir(parents=True, exist_ok=True)
             job.part_path.write_bytes(b"\0" * 100)
             save_state(job)
 

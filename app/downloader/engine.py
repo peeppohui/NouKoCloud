@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import time
 from dataclasses import replace
@@ -25,6 +26,10 @@ PROGRESS_INTERVAL = 0.3      # как часто обновлять интерф
 STATE_SAVE_INTERVAL = 2.0    # как часто сохранять состояние на диск
 
 _FORBIDDEN = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _same_file(a: CloudFile, b: CloudFile) -> bool:
+    return (a.provider, a.file_id, a.path, a.public_key) == (b.provider, b.file_id, b.path, b.public_key)
 
 
 def _safe_name(name: str) -> str:
@@ -60,6 +65,9 @@ class DownloadEngine:
         self._last_emit = 0.0
         self._last_save = 0.0
         self._running: set[str] = set()
+        #: Задачи идущих загрузок: отмена прерывает их сразу, не дожидаясь
+        #: следующего куска данных от медленного облака.
+        self._tasks: dict[str, asyncio.Task] = {}
         self._speed_state: dict[str, tuple[float, int]] = {}
 
     # ------------------------------------------------------------------
@@ -85,8 +93,14 @@ class DownloadEngine:
         """Ставит файлы в очередь. Возвращает созданные задания."""
         created: list[DownloadJob] = []
         for file in files:
-            safe_file = replace(file, name=_safe_name(file.name))
-            job = DownloadJob(file=safe_file, dest_dir=self._dest_for(safe_file, dest_dir))
+            if any(_same_file(job.file, file) and job.dest_dir == dest_dir
+                   and job.state in (JobState.QUEUED, JobState.RUNNING, JobState.PAUSED)
+                   for job in self._jobs.values()):
+                continue    # уже в очереди — второй поток писал бы в тот же файл
+            # Файл ложится прямо в папку загрузок, без папок из облака.
+            name = self._free_name(_safe_name(file.name), file, dest_dir)
+            safe_file = replace(file, name=name)
+            job = DownloadJob(file=safe_file, dest_dir=dest_dir)
             job.pause_event.set()
             self._jobs[job.job_id] = job
             self._order.append(job.job_id)
@@ -97,15 +111,30 @@ class DownloadEngine:
         await self.start()
         return created
 
-    @staticmethod
-    def _dest_for(file: CloudFile, root: Path) -> Path:
-        """Сохраняет структуру папок облака внутри папки загрузок."""
-        rel = (file.path or file.name).replace("\\", "/").strip("/")
-        parts = [part for part in rel.split("/") if part and part not in (".", "..")]
-        if len(parts) > 1:
-            # Имена папок в облаке тоже могут содержать «:», «?» и т. п.
-            return root.joinpath(*(_safe_name(part) for part in parts[:-1]))
-        return root
+    def _free_name(self, name: str, file: CloudFile, dest_dir: Path) -> str:
+        """Имя без столкновений: все файлы теперь в одной папке, а у камер
+        имена повторяются (C0001.MP4 в «Камера A» и в «Камера B»).
+
+        Тот же файл, поставленный ещё раз, получает то же имя — тогда
+        загрузка поймёт, что он уже скачан или уже в очереди.
+        """
+        taken: dict[str, CloudFile] = {}
+        for job in self._jobs.values():
+            if job.dest_dir == dest_dir and job.state not in (JobState.CANCELLED,):
+                taken[job.file.name.lower()] = job.file
+        stem, suffix = os.path.splitext(name)
+        for attempt in range(1000):
+            candidate = name if attempt == 0 else f"{stem} ({attempt + 1}){suffix}"
+            other = taken.get(candidate.lower())
+            if other is not None:
+                if _same_file(other, file):
+                    return candidate
+                continue
+            final = dest_dir / candidate
+            if final.exists() and file.size and final.stat().st_size != file.size:
+                continue    # чужой файл с тем же именем — не трогаем его
+            return candidate
+        return name
 
     async def recover(self, dest_dir: Path) -> list[DownloadJob]:
         """Поднимает незаконченные загрузки после перезапуска программы."""
@@ -155,9 +184,10 @@ class DownloadEngine:
             return
         job.cancel_event.set()
         job.pause_event.set()
-        if job.state in (JobState.QUEUED, JobState.PAUSED):
+        if job.state in (JobState.QUEUED, JobState.PAUSED, JobState.RUNNING):
             job.state = JobState.CANCELLED
             job.finished_at = time.time()
+        self._interrupt(job_id)
         if job_id not in self._running:
             # Работающее задание уберёт за собой само (см. _run_job).
             self._drop_unfinished(job)
@@ -170,6 +200,7 @@ class DownloadEngine:
             return
         job.cancel_event.set()
         job.pause_event.set()
+        self._interrupt(job_id)
         # Прогресс упавшей загрузки сохраняем: её подхватит recover().
         if job_id not in self._running and job.state is not JobState.FAILED:
             self._drop_unfinished(job)
@@ -216,8 +247,22 @@ class DownloadEngine:
         )
         transfer = Transfer(ctx)
 
+        task = asyncio.create_task(transfer.run(job), name=f"job-{job.job_id}")
+        self._tasks[job.job_id] = task
         try:
-            ok = await transfer.run(job)
+            ok = await task
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                # Останавливается сам движок (закрытие программы).
+                job.state = JobState.CANCELLED
+                raise
+            # Пользователь отменил загрузку: задачу прервали в _interrupt.
+            job.state = JobState.CANCELLED
+            job.finished_at = job.finished_at or time.time()
+            log.info("Отменено: %s", job.file.name)
+            if not self._closing:
+                self._drop_unfinished(job)
         except Cancelled:
             job.state = JobState.CANCELLED
             job.finished_at = time.time()
@@ -226,9 +271,6 @@ class DownloadEngine:
             # продолжить после перезапуска. Отмену пользователем — нет.
             if not self._closing:
                 self._drop_unfinished(job)
-        except asyncio.CancelledError:
-            job.state = JobState.CANCELLED
-            raise
         except Exception as exc:
             job.state = JobState.FAILED
             job.error = friendly_error(exc, provider=job.file.provider.value)
@@ -240,10 +282,17 @@ class DownloadEngine:
             else:
                 job.state = JobState.FAILED
             job.finished_at = time.time()
+        finally:
+            self._tasks.pop(job.job_id, None)
 
         self._emit_snapshot()
         self._bus.job_finished.emit(job)
         self._running.discard(job.job_id)
+
+    def _interrupt(self, job_id: str) -> None:
+        task = self._tasks.get(job_id)
+        if task is not None and not task.done():
+            task.cancel()
 
     @staticmethod
     def _drop_unfinished(job: DownloadJob) -> None:

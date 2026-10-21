@@ -1,24 +1,24 @@
-"""Панель очереди загрузок."""
+"""Очередь загрузок: карточка на каждый файл, прогресс по частям."""
 
 from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QRectF, Qt, Signal
+from PySide6.QtGui import QPainter, QPainterPath
 from PySide6.QtWidgets import (
-    QAbstractItemView,
+    QFrame,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
-    QProgressBar,
-    QPushButton,
-    QTableWidget,
-    QTableWidgetItem,
+    QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
 from ..core.models import DownloadJob, JobState
+from . import theme
+from .widgets import IconLabel, button, icon_button, label
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +31,17 @@ STATE_TEXT = {
     JobState.CANCELLED: "Отменено",
     JobState.SKIPPED: "Уже скачан",
 }
+STATE_ICON = {
+    JobState.QUEUED: "clock",
+    JobState.RUNNING: "target",
+    JobState.PAUSED: "pause",
+    JobState.DONE: "check",
+    JobState.FAILED: "alert",
+    JobState.CANCELLED: "close",
+    JobState.SKIPPED: "check",
+}
+FINISHED = (JobState.DONE, JobState.FAILED, JobState.CANCELLED, JobState.SKIPPED)
+MAX_PARTS = 8
 
 
 def human_size(size: int) -> str:
@@ -48,6 +59,199 @@ def human_speed(bps: float) -> str:
     return f"{human_size(int(bps))}/с"
 
 
+def human_eta(seconds: float) -> str:
+    if seconds <= 0:
+        return ""
+    if seconds < 60:
+        return "ещё ~1 мин" if seconds > 30 else "ещё несколько секунд"
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"ещё ~{minutes} мин"
+    return f"ещё ~{minutes // 60} ч {minutes % 60:02d} мин"
+
+
+def job_color_role(job: DownloadJob) -> str:
+    """Цвет задания — имя цвета палитры (чтобы перекрашиваться при смене темы)."""
+    if job.state is JobState.FAILED:
+        return "err"
+    if job.state in (JobState.DONE, JobState.SKIPPED):
+        return "ok"
+    if job.state is JobState.RUNNING:
+        return "text"
+    return "muted"
+
+
+def part_fractions(job: DownloadJob) -> list[float]:
+    """Доля скачанного в каждой части (не больше MAX_PARTS полосок)."""
+    if job.state in (JobState.DONE, JobState.SKIPPED):
+        count = max(1, min(MAX_PARTS, len(job.segments) or 1))
+        return [1.0] * count
+    segments = sorted(job.segments, key=lambda s: s.start)
+    if not segments:
+        total = job.total_bytes or job.file.size
+        return [min(1.0, job.downloaded_bytes / total) if total else 0.0]
+    if len(segments) <= MAX_PARTS:
+        return [min(1.0, s.received / max(1, s.total)) for s in segments]
+    # Частей больше, чем полосок: склеиваем соседние.
+    groups: list[float] = []
+    per = len(segments) / MAX_PARTS
+    for i in range(MAX_PARTS):
+        chunk = segments[int(i * per):int((i + 1) * per)] or segments[-1:]
+        got = sum(s.received for s in chunk)
+        size = sum(s.total for s in chunk)
+        groups.append(min(1.0, got / max(1, size)))
+    return groups
+
+
+def status_line(job: DownloadJob) -> tuple[str, str]:
+    """(состояние, подробности) — как в макете: «Качается · 42% · 12.6 МБ/с · ещё ~5 мин»."""
+    if job.state is JobState.FAILED:
+        return (f"Файл не скачан: {job.error}" if job.error else "Ошибка"), ""
+    state = STATE_TEXT.get(job.state, "")
+    parts: list[str] = []
+    if job.state is JobState.RUNNING:
+        parts.append(f"{job.percent}%")
+        if job.speed_bps > 0:
+            parts.append(human_speed(job.speed_bps))
+            total = job.total_bytes or job.file.size
+            eta = human_eta((total - job.downloaded_bytes) / job.speed_bps) if total else ""
+            if eta:
+                parts.append(eta)
+    elif job.state is JobState.PAUSED:
+        parts.append(f"{job.percent}%")
+        parts.append("докачается с места остановки")
+    elif job.state in (JobState.DONE, JobState.SKIPPED):
+        parts.append(str(job.dest_dir))
+    return state, ("".join(" · " + p for p in parts))
+
+
+class PartsBar(QWidget):
+    """Полоски прогресса по частям файла."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._fractions: list[float] = [0.0]
+        self._role = "text"
+        self.setFixedHeight(5)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def set_state(self, fractions: list[float], role: str) -> None:
+        if fractions != self._fractions or role != self._role:
+            self._fractions = fractions or [0.0]
+            self._role = role
+            self.update()
+
+    def paintEvent(self, _event) -> None:  # noqa: N802
+        palette = theme.current()
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        count = len(self._fractions)
+        gap = 3.0
+        width = (self.width() - gap * (count - 1)) / count
+        h = float(self.height())
+        track = theme.qcolor(palette.raised)
+        fill = theme.qcolor(getattr(palette, self._role))
+        for i, fraction in enumerate(self._fractions):
+            x = i * (width + gap)
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(x, 0, width, h), h / 2, h / 2)
+            painter.fillPath(path, track)
+            if fraction > 0:
+                painter.save()
+                painter.setClipPath(path)
+                painter.fillRect(QRectF(x, 0, width * fraction, h), fill)
+                painter.restore()
+        painter.end()
+
+
+class JobCard(QFrame):
+    def __init__(self, view: "QueueView", job_id: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.job_id = job_id
+        self._view = view
+        self._state: JobState | None = None
+        self.setProperty("job", True)
+        grid = QHBoxLayout(self)
+        grid.setContentsMargins(12, 12, 12, 12)
+        grid.setSpacing(12)
+
+        self._icon = IconLabel("clock", "muted", 18, self)
+        holder = QLabel(self)
+        holder.setProperty("jobIcon", True)
+        holder.setFixedSize(36, 36)
+        hl = QHBoxLayout(holder)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.addWidget(self._icon, 0, Qt.AlignmentFlag.AlignCenter)
+        grid.addWidget(holder, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        middle = QVBoxLayout()
+        middle.setSpacing(7)
+        top = QHBoxLayout()
+        top.setSpacing(12)
+        self._name = QLabel("", self)
+        self._name.setMinimumWidth(60)
+        self._name.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        top.addWidget(self._name, 1)
+        self._size = label("", "muted", self)
+        top.addWidget(self._size)
+        middle.addLayout(top)
+        self._bar = PartsBar(self)
+        middle.addWidget(self._bar)
+        self._line = QLabel("", self)
+        self._line.setProperty("role", "hint")
+        self._line.setTextFormat(Qt.TextFormat.RichText)
+        self._line.setMinimumWidth(60)
+        self._line.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        middle.addWidget(self._line)
+        grid.addLayout(middle, 1)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(4)
+        self._btn_pause = icon_button("pause", "Пауза", self, size=36, icon_size=14)
+        self._btn_resume = icon_button("play", "Продолжить", self, size=36, icon_size=16)
+        self._btn_open = icon_button("folder", "Открыть папку", self, size=36)
+        self._btn_x = icon_button("close", "Отменить", self, size=36, icon_size=16)
+        self._btn_pause.clicked.connect(lambda: view.pause_requested.emit(self.job_id))
+        self._btn_resume.clicked.connect(lambda: view.resume_requested.emit(self.job_id))
+        self._btn_open.clicked.connect(view.open_folder_requested)
+        self._btn_x.clicked.connect(self._on_x)
+        for btn in (self._btn_pause, self._btn_resume, self._btn_open, self._btn_x):
+            actions.addWidget(btn)
+        grid.addLayout(actions)
+
+    def _on_x(self) -> None:
+        if self._state in FINISHED:
+            self._view.remove_requested.emit(self.job_id)
+        else:
+            self._view.cancel_requested.emit(self.job_id)
+
+    def update_job(self, job: DownloadJob) -> None:
+        role = job_color_role(job)
+        color = getattr(theme.current(), role)
+        if job.state is not self._state:
+            self._state = job.state
+            self._icon.set_icon(STATE_ICON.get(job.state, "clock"), role)
+            self._btn_pause.setVisible(job.state in (JobState.RUNNING, JobState.QUEUED))
+            self._btn_resume.setVisible(job.state in (JobState.PAUSED, JobState.FAILED, JobState.CANCELLED))
+            self._btn_open.setVisible(job.state in (JobState.DONE, JobState.SKIPPED))
+            finished = job.state in FINISHED
+            self._btn_x.setToolTip("Убрать из списка" if finished else "Отменить")
+            self._btn_x.setAccessibleName(self._btn_x.toolTip())
+        self._name.setText(job.file.name)
+        self._name.setToolTip(job.final_path.as_posix())
+        self._size.setText(human_size(job.total_bytes or job.file.size))
+        self._bar.set_state(part_fractions(job), role)
+        state, details = status_line(job)
+        self._line.setText(
+            f'<span style="color:{color}">{_escape(state)}</span>{_escape(details)}'
+        )
+        self._line.setToolTip(state + details)
+
+
+def _escape(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 class QueueView(QWidget):
     pause_requested = Signal(str)
     resume_requested = Signal(str)
@@ -57,154 +261,94 @@ class QueueView(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._rows: dict[str, int] = {}
-        self._bars: dict[str, QProgressBar] = {}
+        self._cards: dict[str, JobCard] = {}
+        self._jobs: dict[str, DownloadJob] = {}
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setContentsMargins(16, 20, 16, 16)
+        layout.setSpacing(12)
 
         top = QHBoxLayout()
-        top.setSpacing(8)
-        title = QLabel("Очередь загрузок", self)
-        title.setProperty("heading", True)
-        top.addWidget(title)
+        top.setContentsMargins(4, 0, 4, 0)
+        title = label("очередь", "h3", self)
+        top.addWidget(title, 0, Qt.AlignmentFlag.AlignBottom)
         top.addStretch(1)
-        self._summary = QLabel("", self)
-        self._summary.setProperty("muted", True)
-        top.addWidget(self._summary)
+        self._summary = label("", "muted", self)
+        top.addWidget(self._summary, 0, Qt.AlignmentFlag.AlignBottom)
         layout.addLayout(top)
 
-        self._table = QTableWidget(0, 5, self)
-        self._table.setHorizontalHeaderLabels(["Файл", "Размер", "Прогресс", "Скорость", "Состояние"])
-        self._table.verticalHeader().setVisible(False)
-        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        self._table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self._table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        self._table.setColumnWidth(2, 170)
-        layout.addWidget(self._table, 1)
+        self._scroll = QScrollArea(self)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        body = QWidget()
+        self._list = QVBoxLayout(body)
+        self._list.setContentsMargins(0, 0, 0, 0)
+        self._list.setSpacing(8)
+        self._empty = label("Очередь пуста. Отметьте файлы слева и нажмите «Скачать выбранное».",
+                            "muted", body, wrap=True)
+        self._list.addWidget(self._empty)
+        self._list.addStretch(1)
+        self._scroll.setWidget(body)
+        layout.addWidget(self._scroll, 1)
 
         buttons = QHBoxLayout()
         buttons.setSpacing(8)
-        self._btn_pause = QPushButton("Пауза", self)
-        self._btn_resume = QPushButton("Продолжить", self)
-        self._btn_cancel = QPushButton("Отменить", self)
-        self._btn_remove = QPushButton("Убрать из списка", self)
-        self._btn_open = QPushButton("Открыть папку", self)
-        for button in (self._btn_pause, self._btn_resume, self._btn_cancel,
-                       self._btn_remove, self._btn_open):
-            buttons.addWidget(button)
+        self._btn_open = button("Открыть папку", "outline", self, icon_name="folder")
+        self._btn_open.clicked.connect(self.open_folder_requested)
+        self._btn_clear = button("Убрать готовые", "ghost", self)
+        self._btn_clear.setToolTip("Убрать из списка скачанные, отменённые и неудачные файлы")
+        self._btn_clear.clicked.connect(self._remove_finished)
+        buttons.addWidget(self._btn_open)
+        buttons.addWidget(self._btn_clear)
         buttons.addStretch(1)
         layout.addLayout(buttons)
-
-        self._btn_pause.clicked.connect(lambda: self._for_selected(self.pause_requested))
-        self._btn_resume.clicked.connect(lambda: self._for_selected(self.resume_requested))
-        self._btn_cancel.clicked.connect(lambda: self._for_selected(self.cancel_requested))
-        self._btn_remove.clicked.connect(lambda: self._for_selected(self.remove_requested))
-        self._btn_open.clicked.connect(self.open_folder_requested)
-
-        self._update_buttons()
+        theme.manager().changed.connect(self._on_theme)
 
     # ------------------------------------------------------------------
-    def _for_selected(self, signal: Signal) -> None:
-        for job_id in self.selected_job_ids():
-            signal.emit(job_id)
-
     def selected_job_ids(self) -> list[str]:
-        rows = sorted({index.row() for index in self._table.selectedIndexes()})
-        result = []
-        for row in rows:
-            item = self._table.item(row, 0)
-            if item is not None:
-                result.append(item.data(Qt.ItemDataRole.UserRole))
-        return result
+        """Совместимость: в карточках действия у каждого файла свои."""
+        return []
 
-    def _update_buttons(self) -> None:
-        has = bool(self.selected_job_ids())
-        self._btn_pause.setEnabled(has)
-        self._btn_resume.setEnabled(has)
-        self._btn_cancel.setEnabled(has)
-        self._btn_remove.setEnabled(has)
+    def job_count(self) -> int:
+        return len(self._cards)
+
+    def _remove_finished(self) -> None:
+        for job_id, job in list(self._jobs.items()):
+            if job.state in FINISHED:
+                self.remove_requested.emit(job_id)
+
+    def _on_theme(self, _palette) -> None:
+        for job_id, card in self._cards.items():
+            job = self._jobs.get(job_id)
+            if job is not None:
+                card.update_job(job)
 
     # ------------------------------------------------------------------
     def sync(self, jobs: list[DownloadJob]) -> None:
         """Полная перерисовка списка."""
-        self._table.setUpdatesEnabled(False)
-        try:
-            wanted = {job.job_id for job in jobs}
-            for job_id in [jid for jid in self._rows if jid not in wanted]:
-                row = self._rows.pop(job_id)
-                self._bars.pop(job_id, None)
-                self._table.removeRow(row)
-                self._reindex()
-            for job in jobs:
-                if job.job_id in self._rows:
-                    continue
-                row = self._table.rowCount()
-                self._table.insertRow(row)
-                self._rows[job.job_id] = row
-
-                bar = QProgressBar(self)
-                bar.setRange(0, 100)
-                bar.setTextVisible(False)
-                bar.setFixedHeight(10)
-                self._table.setCellWidget(row, 2, bar)
-                self._bars[job.job_id] = bar
-
-                for column in (0, 1, 3, 4):
-                    item = QTableWidgetItem()
-                    if column == 0:
-                        item.setData(Qt.ItemDataRole.UserRole, job.job_id)
-                    self._table.setItem(row, column, item)
-            for job in jobs:
-                self.update_job(job, full=True)
-        finally:
-            self._table.setUpdatesEnabled(True)
-        self._update_buttons()
-
-    def _reindex(self) -> None:
-        self._rows = {}
-        for row in range(self._table.rowCount()):
-            item = self._table.item(row, 0)
-            if item is None:
-                continue
-            job_id = item.data(Qt.ItemDataRole.UserRole)
-            if job_id:
-                self._rows[job_id] = row
+        wanted = {job.job_id for job in jobs}
+        for job_id in [jid for jid in self._cards if jid not in wanted]:
+            card = self._cards.pop(job_id)
+            self._jobs.pop(job_id, None)
+            self._list.removeWidget(card)
+            card.hide()
+            card.deleteLater()
+        for job in jobs:
+            if job.job_id not in self._cards:
+                card = JobCard(self, job.job_id, self._scroll.widget())
+                self._cards[job.job_id] = card
+                self._list.insertWidget(self._list.count() - 1, card)
+            self.update_job(job, full=True)
+        self._empty.setVisible(not self._cards)
+        self._btn_clear.setEnabled(any(j.state in FINISHED for j in self._jobs.values()))
 
     def update_job(self, job: DownloadJob, full: bool = False) -> None:
-        row = self._rows.get(job.job_id)
-        if row is None:
+        card = self._cards.get(job.job_id)
+        if card is None:
             return
-        name_item = self._table.item(row, 0)
-        if name_item is None:
-            return
-        name_item.setText(job.file.name)
-        name_item.setData(Qt.ItemDataRole.UserRole, job.job_id)
-        name_item.setToolTip(job.final_path.as_posix())
-
-        self._table.item(row, 1).setText(human_size(job.total_bytes or job.file.size))
-
-        bar = self._bars.get(job.job_id)
-        if bar is not None:
-            bar.setValue(job.percent)
-
-        speed = job.speed_bps
-        self._table.item(row, 3).setText(human_speed(speed) if job.state is JobState.RUNNING else "—")
-
-        state_item = self._table.item(row, 4)
-        state_item.setText(job.error or STATE_TEXT.get(job.state, ""))
-        if job.state is JobState.FAILED:
-            state_item.setForeground(Qt.GlobalColor.red)
-        elif job.state is JobState.DONE:
-            state_item.setForeground(Qt.GlobalColor.darkGreen)
-        else:
-            state_item.setForeground(Qt.GlobalColor.gray)
+        self._jobs[job.job_id] = job
+        card.update_job(job)
 
     def set_summary(self, total: int, done: int, active: int) -> None:
         self._summary.setText(f"всего {total} · готово {done} · качается {active}")
