@@ -85,7 +85,10 @@ class HttpClient:
                 await _sleep(delay)
                 continue
 
-            if response.status_code == 401:
+            # 401 — протухший вход, но только если мы вообще его слали.
+            # Публичная ссылка без входа тоже может ответить 401, и тогда
+            # «Токен истёк» — неверное объяснение: войти всё равно некуда.
+            if response.status_code == 401 and _has_authorization(headers):
                 raise TokenExpiredError(technical=f"401 от {provider}: {url}")
 
             # Повторяем всё, что в политике: 408, 425, 429, 500, 502, 503, 504.
@@ -161,3 +164,8 @@ async def _sleep(delay: float) -> None:
     import asyncio
 
     await asyncio.sleep(delay)
+
+
+def _has_authorization(headers: Mapping[str, str] | None) -> bool:
+    """Слали ли мы токен в этот запрос."""
+    return any(str(key).lower() == "authorization" for key in (headers or {}))

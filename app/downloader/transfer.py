@@ -239,7 +239,16 @@ class Transfer:
         ]
         if not tasks:
             return
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        try:
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        except asyncio.CancelledError:
+            # Загрузку отменили (закрыли программу): сегменты надо погасить
+            # и забрать их исключения, иначе asyncio при выходе ругается
+            # «Task exception was never retrieved».
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
         errors = [task.exception() for task in done if not task.cancelled() and task.exception()]
         for task in pending:
             task.cancel()

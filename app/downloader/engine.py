@@ -231,23 +231,24 @@ class DownloadEngine:
     # ------------------------------------------------------------------
     async def _worker(self) -> None:
         while not self._closing:
+            # Сначала место, потом работа. Наоборот нельзя: воркеров в пуле
+            # больше, чем лимит файлов, и они забирали бы задания из очереди
+            # наперегонки — и порядок загрузок перепутывался бы.
+            await self._file_limit.acquire()
             try:
                 job_id = await self._queue.get()
             except asyncio.CancelledError:
+                await self._file_limit.release()
                 return
-            job = self._jobs.get(job_id)
-            if job is None:
-                self._queue.task_done()
-                continue
-            await self._file_limit.acquire()
             try:
-                if job.state is not JobState.CANCELLED:
+                job = self._jobs.get(job_id)
+                if job is not None and job.state is not JobState.CANCELLED:
                     await self._run_job(job)
             finally:
-                await self._file_limit.release()
                 # task_done — строго для каждого взятого задания, иначе
-                # очередь не сойдётся (continue его пропускал).
+                # очередь не сойдётся.
                 self._queue.task_done()
+                await self._file_limit.release()
 
     async def _run_job(self, job: DownloadJob) -> None:
         job.state = JobState.RUNNING

@@ -456,6 +456,48 @@ class TestKeepPartialFiles(unittest.IsolatedAsyncioTestCase):
             await engine.stop()
 
 
+class TestDownloadOrder(unittest.IsolatedAsyncioTestCase):
+    """Порядок загрузок должен совпадать с порядком в очереди.
+
+    Раньше воркеров в пуле было больше, чем лимит файлов, и они забирали
+    задания наперегонки — файл №3 мог стартовать раньше файла №2.
+    """
+
+    async def test_files_start_in_order(self) -> None:
+        import tempfile as _tempfile
+
+        with _tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig()
+            config.download_dir = tmp
+            config.max_parallel_files = 2
+            engine = DownloadEngine(config, None, None, None, mock.Mock())  # type: ignore[arg-type]
+
+            started: list[str] = []
+            release = asyncio.Event()
+
+            async def fake_run(job) -> None:
+                started.append(job.file.name)
+                await release.wait()
+
+            engine._run_job = fake_run  # type: ignore[assignment]
+            await engine.start()
+
+            files = []
+            for index in range(6):
+                file = CloudFile(provider=ProviderId.YANDEX, file_id=str(index),
+                                 path=f"/{index}.mp4", name=f"{index}.mp4",
+                                 kind=EntryKind.FILE, size=100, source=SourceKind.PUBLIC)
+                files.append(file)
+            await engine.enqueue(files, Path(tmp))
+
+            await asyncio.sleep(0.3)
+            release.set()
+            await asyncio.sleep(0.3)
+
+            self.assertEqual(started, sorted(started), "файлы должны начинать по порядку")
+            await engine.stop()
+
+
 class TestProgressThrottle(unittest.TestCase):
     """Прогресс и сохранение состояния — на каждое задание, а не на движок.
 
