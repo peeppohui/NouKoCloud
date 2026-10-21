@@ -5,7 +5,7 @@
 отметить нужные файлы и скачать их с докачкой.
 
 ![стек](https://img.shields.io/badge/Python-3.12%2B-blue) ![Qt](https://img.shields.io/badge/PySide6-6.12-green)
-[![Скачать](https://img.shields.io/badge/скачать-НоуКо Cloud-2f6fed?style=flat-square)](https://github.com/peeppohui/NouKoCloud/releases/latest/download/NoukoCloud-win64.zip)
+[![Скачать](https://img.shields.io/badge/скачать-НоуКо%20Cloud-2f6fed?style=flat-square)](https://github.com/peeppohui/NouKoCloud/releases/latest/download/NoukoCloud-win64.zip)
 
 ## 📥 Скачать
 
