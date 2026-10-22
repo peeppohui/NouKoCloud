@@ -18,6 +18,7 @@ from typing import Callable, Optional
 import httpx
 
 from ..core.config import AppConfig
+from ..core.errors import UnsupportedFormatError
 from ..core.models import CloudFile, DownloadJob, DownloadLink, JobState, Segment
 from ..net.backoff import RetryPolicy, compute_delay
 from ..net.http_client import HttpClient
@@ -45,6 +46,10 @@ class RangeNotSupported(Exception):
 
 class ServerCutStream(Exception):
     """Сервер оборвал передачу (типично для архивов на Яндекс.Диске)."""
+
+
+class LinkSwitched(Exception):
+    """Основная ссылка не пустила — повторяем с резервной, без паузы."""
 
 
 def write_at(fd: int, data: bytes, offset: int) -> None:
@@ -273,6 +278,9 @@ class Transfer:
                     raise
                 except Cancelled:
                     raise
+                except LinkSwitched:
+                    # Ссылка уже заменена — пробуем новый адрес сразу.
+                    continue
                 except ServerCutStream:
                     cuts += 1
                     if cuts >= 2:
@@ -318,8 +326,23 @@ class Transfer:
                 # частей (некоторые файлы Яндекс по частям не отдаёт вовсе).
                 await self._refresh_link(job)
                 raise ServerCutStream(f"облако ответило {status} на запрос части файла")
-            if status in (401, 403, 404):
+            if status == 403:
+                body = await self._read_error_body(response)
+                log.info("%s: ответ 403: %s", job.file.name, body or "(пусто)")
+                if self._switch_to_fallback(job, link):
+                    raise LinkSwitched()
+                if job.link_switched:
+                    # Резервная ссылка тоже не пустила — повторять её бессмысленно.
+                    raise httpx.HTTPStatusError(
+                        f"резервная ссылка не пустила ({status})",
+                        request=response.request, response=response,
+                    )
                 # Ссылка протухла — перевыпускаем и пробуем снова.
+                await self._refresh_link(job)
+                raise httpx.HTTPStatusError(
+                    f"ссылка протухла ({status})", request=response.request, response=response
+                )
+            if status in (401, 404):
                 await self._refresh_link(job)
                 raise httpx.HTTPStatusError(
                     f"ссылка протухла ({status})", request=response.request, response=response
@@ -327,7 +350,10 @@ class Transfer:
             if status == 200:
                 raise RangeNotSupported()
             if status >= 400:
+                await self._read_error_body(response)
                 response.raise_for_status()
+
+            await self._reject_html(job, link, response)
 
             expected = seg.total - seg.received
             offset = start
@@ -387,6 +413,9 @@ class Transfer:
                     break
             except Cancelled:
                 raise
+            except LinkSwitched:
+                # Не ошибка: просто другой адрес того же файла.
+                continue
             except Exception as exc:
                 attempts += 1
                 if attempts > max_attempts:
@@ -410,7 +439,21 @@ class Transfer:
         )
         try:
             status = response.status_code
-            if status in (401, 403, 404) or status >= 500:
+            if status == 403:
+                body = await self._read_error_body(response)
+                log.info("%s: ответ 403: %s", job.file.name, body or "(пусто)")
+                if self._switch_to_fallback(job, link):
+                    raise LinkSwitched()
+                if job.link_switched:
+                    raise httpx.HTTPStatusError(
+                        f"резервная ссылка не пустила ({status})",
+                        request=response.request, response=response,
+                    )
+                await self._refresh_link(job)
+                raise httpx.HTTPStatusError(
+                    f"ссылка протухла ({status})", request=response.request, response=response
+                )
+            if status in (401, 404) or status >= 500:
                 await self._refresh_link(job)
                 raise httpx.HTTPStatusError(
                     f"ссылка протухла ({status})", request=response.request, response=response
@@ -422,7 +465,10 @@ class Transfer:
                 seg.received = 0
                 start = 0
             if status >= 400:
+                await self._read_error_body(response)
                 response.raise_for_status()
+
+            await self._reject_html(job, link, response)
 
             offset = start
             expected = max(0, seg.total - seg.received)
@@ -454,6 +500,41 @@ class Transfer:
         job.segments = [Segment(index=0, start=0, end=max(0, total - 1))]
         job.downloaded_bytes = 0
         save_state(job)
+
+    @staticmethod
+    async def _read_error_body(response: httpx.Response) -> str:
+        """Тело ошибки до закрытия ответа — иначе причину 403 не узнать."""
+        try:
+            raw = await response.aread()
+        except Exception:
+            return ""
+        text = raw[:400].decode("utf-8", "replace")
+        return " ".join(text.split())
+
+    def _switch_to_fallback(self, job: DownloadJob, link: DownloadLink) -> bool:
+        if link.fallback is None:
+            return False
+        job.link = link.fallback
+        job.link_switched = True
+        log.info("%s: переключаемся на резервную ссылку", job.file.name)
+        return True
+
+    async def _reject_html(self, job: DownloadJob, link: DownloadLink,
+                           response: httpx.Response) -> None:
+        """HTML вместо файла — типичная страница-заглушка Google."""
+        ctype = (response.headers.get("content-type") or "").lower()
+        if not ctype.startswith("text/html"):
+            return
+        body = await self._read_error_body(response)
+        log.warning("%s: вместо файла пришла HTML-страница: %s",
+                    job.file.name, body[:200] or "(пусто)")
+        if self._switch_to_fallback(job, link):
+            raise LinkSwitched()
+        raise UnsupportedFormatError(
+            "Облако вернуло страницу вместо файла. Скорее всего, файл защищён "
+            "от скачивания — попробуйте скачать его через браузер.",
+            technical=f"HTML вместо файла: {body[:300]}",
+        )
 
     async def _refresh_link(self, job: DownloadJob) -> None:
         provider = self._ctx.registry.get(job.file.provider)

@@ -127,6 +127,32 @@ class TestFriendlyErrors(unittest.TestCase):
         exc = httpx.HTTPStatusError("boom", request=response.request, response=response)
         self.assertIn("лимит", friendly_error(exc, provider="google").lower())
 
+    def test_google_download_quota(self) -> None:
+        import httpx
+
+        response = httpx.Response(
+            403,
+            json={"error": {"message": "The download quota for this file has been exceeded",
+                            "status": "RESOURCE_EXHAUSTED"}},
+            request=httpx.Request("GET", "http://x"),
+        )
+        exc = httpx.HTTPStatusError("boom", request=response.request, response=response)
+        message = friendly_error(exc, provider="google")
+        self.assertIn("скачивани", message.lower())
+        self.assertIn("браузер", message.lower())
+
+    def test_google_download_restricted(self) -> None:
+        import httpx
+
+        response = httpx.Response(
+            403,
+            json={"error": {"message": "This file cannot be downloaded",
+                            "errors": [{"reason": "cannotDownloadFile"}]}},
+            request=httpx.Request("GET", "http://x"),
+        )
+        exc = httpx.HTTPStatusError("boom", request=response.request, response=response)
+        self.assertIn("запретил", friendly_error(exc, provider="google").lower())
+
     def test_no_stacktrace_in_message(self) -> None:
         message = friendly_error(ValueError("какая-то внутренняя ошибка"))
         self.assertNotIn("Traceback", message)

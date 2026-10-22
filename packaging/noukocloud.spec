@@ -168,15 +168,11 @@ def _trim_languages(target: Path) -> None:
 
 
 def _bundle_ffmpeg(target: Path) -> None:
-    """Кладёт ffmpeg и ffprobe (bin/) рядом с программой.
+    """Кладёт ffmpeg (bin/ffmpeg.exe + лицензия) рядом с программой.
 
-    Пользователь скачивает один архив — ffmpeg уже внутри, ставить ничего
-    не нужно. Если в проекте их ещё нет, скачиваем (tools/fetch_ffmpeg.py).
-    NOUKOCLOUD_SKIP_FFMPEG=1 — собрать без них (быстрая проверочная сборка).
-
-    ffprobe нужен не меньше ffmpeg: yt-dlp через него узнаёт кодек звука
-    и длительность. Без него склейка видео со звуком (а у YouTube они
-    лежат отдельно) падает с «unable to obtain file audio codec with ffprobe».
+    Пользователь скачивает один архив — ffmpeg уже внутри. Если в проекте
+    его ещё нет, скачиваем (tools/fetch_ffmpeg.py). NOUKOCLOUD_SKIP_FFMPEG=1 —
+    собрать без него (быстрая проверочная сборка).
     """
     import shutil
     import subprocess
@@ -194,7 +190,8 @@ def _bundle_ffmpeg(target: Path) -> None:
     dest = target / "bin"
     dest.mkdir(parents=True, exist_ok=True)
     for item in source.iterdir():
-        if item.is_file():
+        # ffprobe программе не нужен (−100 МБ к архиву).
+        if item.is_file() and item.name.lower() != "ffprobe.exe":
             shutil.copy2(item, dest / item.name)
     print(f"  ffmpeg: {dest}")
 

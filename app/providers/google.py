@@ -4,10 +4,12 @@
 * `files.list` — постраничный (до 1000 на страницу), 10 000 запросов
   на 100 секунд на проект; при превышении — 403 с reason
   `rateLimitExceeded` / `userRateLimitExceeded`;
-* скачивание бинарников — `files.get?alt=media` (держит Range);
+* публичные бинарники качаются браузерным адресом
+  `drive.usercontent.google.com/download` (держит Range, не тратит квоту
+  ключа), официальный `files.get?alt=media` — запасной;
 * Google Документы/Таблицы/Презентации скачиваются только через
   `files.export` (и не всё: экспорт в PDF ограничен ~10 МБ);
-* публичная папка читается через `api key` (без входа в аккаунт),
+* публичная папка читается через `api key` или вход в аккаунт,
   общий диск — через `corpora=drive&driveId=...`.
 """
 
@@ -24,6 +26,9 @@ log = logging.getLogger(__name__)
 
 API = "https://www.googleapis.com/drive/v3"
 UPLOAD_API = "https://www.googleapis.com/upload/drive/v3"
+#: Публичный адрес скачивания — тот же, что открывает браузер. Не требует
+#: API-ключа и не тратит квоту проекта; поддерживает Range (проверено).
+WEB_DOWNLOAD = "https://drive.usercontent.google.com/download"
 # В Drive API v3 длительность видео — durationMillis. С несуществующим полем
 # (было durationMs) Google отвечает 400 на весь список, и «Мой диск» не открывался.
 FIELDS = (
@@ -50,9 +55,21 @@ class GoogleProvider(CloudProvider):
 
     # ------------------------------------------------------------------
     async def _headers(self, ctx: BrowseContext) -> dict[str, str]:
-        """Для своего аккаунта — токен, для публичной ссылки — api key."""
+        """Для своего аккаунта — токен, для публичной ссылки — api key.
+
+        Публичную ссылку можно читать и от имени вошедшего пользователя:
+        без этого сообщение «войдите в аккаунт» было ложью — список всё
+        равно падал с 403.
+        """
         if ctx.source is SourceKind.PUBLIC:
-            key = self.config.google_api_key
+            if self.config.google_api_key:
+                return {}
+            return await self._oauth_headers()
+        token = await self.oauth.access_token(ProviderId.GOOGLE)
+        return {"Authorization": f"Bearer {token}"}
+
+    async def _oauth_headers(self) -> dict[str, str]:
+        if not self.oauth.is_logged_in(ProviderId.GOOGLE):
             return {}
         token = await self.oauth.access_token(ProviderId.GOOGLE)
         return {"Authorization": f"Bearer {token}"}
@@ -185,42 +202,78 @@ class GoogleProvider(CloudProvider):
     async def resolve_download(self, file: CloudFile) -> DownloadLink:
         # Ссылка собирается локально, без запроса к API, поэтому кэш не нужен:
         # иначе вместе со ссылкой пришлось бы хранить и (протухающий) токен.
-        params: dict = {"supportsAllDrives": "true"}
+        google_mime = file.google_mime or file.mime or ""
+        if google_mime.startswith(GOOGLE_APP_MIME_PREFIX):
+            return await self._export_link(file, google_mime)
+
         if file.source is SourceKind.PUBLIC:
+            # Публичные файлы качаем тем же адресом, что и браузер: он не
+            # зависит от API-ключа и его квоты. Официальный API оставляем
+            # резервом — он выручает, если файл открыт не «всем по ссылке»,
+            # а конкретному аккаунту (тогда нужен вход).
+            link = self._web_link(file)
+            fallback = await self._api_media_link(file, public=True)
+            if fallback is not None:
+                link.fallback = fallback
+            return link
+        return await self._api_media_link(file, public=False)
+
+    def _web_link(self, file: CloudFile) -> DownloadLink:
+        params = {"id": file.file_id, "export": "download", "confirm": "t"}
+        if file.resource_key:
+            params["resourcekey"] = file.resource_key
+        return DownloadLink(
+            url=f"{WEB_DOWNLOAD}?{urlencode(params)}",
+            headers={"Accept-Encoding": "identity"},
+            method="GET",
+            size=file.size or None,
+            expires_at=None,
+            content_type=file.mime or None,
+        )
+
+    async def _auth(self, file: CloudFile, *, public: bool) -> tuple[dict, dict[str, str]]:
+        """Параметры и заголовки доступа: ключ, вход или ничего."""
+        params: dict = {"supportsAllDrives": "true"}
+        headers: dict[str, str] = {}
+        if public:
             if self.config.google_api_key:
                 params["key"] = self.config.google_api_key
-            headers: dict[str, str] = {}
+            else:
+                headers.update(await self._oauth_headers())
         else:
-            headers = {"Authorization": f"Bearer {await self.oauth.access_token(ProviderId.GOOGLE)}"}
+            token = await self.oauth.access_token(ProviderId.GOOGLE)
+            headers["Authorization"] = f"Bearer {token}"
         if file.resource_key:
             # Drive v3 принимает ключ ресурса только заголовком.
             headers["X-Goog-Drive-Resource-Keys"] = f"{file.file_id}/{file.resource_key}"
+        return params, headers
 
-        google_mime = file.google_mime or file.mime or ""
-        if google_mime.startswith(GOOGLE_APP_MIME_PREFIX):
-            export_mime, ext = EXPORT_MIME.get(google_mime, ("application/pdf", ".pdf"))
-            params["mimeType"] = export_mime
-            url = f"{API}/files/{file.file_id}/export?{urlencode(params)}"
-            link = DownloadLink(
-                url=url,
-                headers={**headers, "Accept-Encoding": "identity"},
-                method="GET",
-                size=None,
-                expires_at=None,
-                content_type=export_mime,
-            )
-        else:
-            params["alt"] = "media"
-            url = f"{API}/files/{file.file_id}?{urlencode(params)}"
-            link = DownloadLink(
-                url=url,
-                headers={**headers, "Accept-Encoding": "identity"},
-                method="GET",
-                size=file.size or None,
-                expires_at=None,
-                content_type=file.mime or None,
-            )
-        return link
+    async def _api_media_link(self, file: CloudFile, *, public: bool) -> Optional[DownloadLink]:
+        if public and not self.config.google_api_key and not self.oauth.is_logged_in(ProviderId.GOOGLE):
+            return None
+        params, headers = await self._auth(file, public=public)
+        params["alt"] = "media"
+        return DownloadLink(
+            url=f"{API}/files/{file.file_id}?{urlencode(params)}",
+            headers={**headers, "Accept-Encoding": "identity"},
+            method="GET",
+            size=file.size or None,
+            expires_at=None,
+            content_type=file.mime or None,
+        )
+
+    async def _export_link(self, file: CloudFile, google_mime: str) -> DownloadLink:
+        params, headers = await self._auth(file, public=file.source is SourceKind.PUBLIC)
+        export_mime, _ext = EXPORT_MIME.get(google_mime, ("application/pdf", ".pdf"))
+        params["mimeType"] = export_mime
+        return DownloadLink(
+            url=f"{API}/files/{file.file_id}/export?{urlencode(params)}",
+            headers={**headers, "Accept-Encoding": "identity"},
+            method="GET",
+            size=None,
+            expires_at=None,
+            content_type=export_mime,
+        )
 
     # ------------------------------------------------------------------
     async def probe_media(self, file: CloudFile) -> MediaInfo:

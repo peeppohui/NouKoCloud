@@ -78,6 +78,9 @@ class DownloadLink:
     supports_range: bool = True
     content_type: str | None = None
     etag: str | None = None
+    #: Резервный адрес того же файла (например, официальный API после
+    #: публичного веб-адреса Google). Используется, если основной отдал 403.
+    fallback: "DownloadLink | None" = None
 
     def is_expired(self, skew: float = 60.0) -> bool:
         if self.expires_at is None:
@@ -149,6 +152,8 @@ class DownloadJob:
     attempts: int = 0
     segments: list[Segment] = field(default_factory=list)
     link: DownloadLink | None = None
+    #: Уже переключились на резервную ссылку — назад не возвращаемся.
+    link_switched: bool = False
     created_at: float = field(default_factory=time.time)
     finished_at: float | None = None
     priority: int = 0

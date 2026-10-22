@@ -284,6 +284,12 @@ class TestConfigSafety(unittest.TestCase):
 
 
 class FakeOAuth:
+    def __init__(self, logged_in: bool = True) -> None:
+        self.logged_in = logged_in
+
+    def is_logged_in(self, _pid) -> bool:
+        return self.logged_in
+
     async def access_token(self, _pid) -> str:
         return "secret-token"
 
@@ -311,6 +317,51 @@ class TestLinks(unittest.TestCase):
         self.assertEqual(query.get("alt"), ["media"])
         self.assertEqual(link.headers["Authorization"], "Bearer secret-token")
         self.assertEqual(link.headers["X-Goog-Drive-Resource-Keys"], "abc/rk")
+
+    def test_google_public_download_uses_web_endpoint(self) -> None:
+        """Публичный файл качаем как браузер: API-ключ и его квота не нужны."""
+        provider = GoogleProvider(None, FakeOAuth(logged_in=False), self.cache, self.config)
+        link = asyncio.run(provider.resolve_download(
+            self._google_file(source=SourceKind.PUBLIC, resource_key="rk")))
+        parsed = urlparse(link.url)
+        self.assertEqual(parsed.netloc, "drive.usercontent.google.com")
+        query = parse_qs(parsed.query)
+        self.assertEqual(query.get("id"), ["abc"])
+        self.assertEqual(query.get("export"), ["download"])
+        self.assertEqual(query.get("confirm"), ["t"])
+        self.assertEqual(query.get("resourcekey"), ["rk"])
+        self.assertNotIn("Authorization", link.headers)
+        self.assertIsNone(link.fallback, "без ключа и входа резерв бессмысленен")
+
+    def test_google_public_download_keeps_api_as_fallback(self) -> None:
+        self.config.google_api_key = "test-key"
+        provider = GoogleProvider(None, FakeOAuth(logged_in=False), self.cache, self.config)
+        link = asyncio.run(provider.resolve_download(
+            self._google_file(source=SourceKind.PUBLIC)))
+        self.assertIsNotNone(link.fallback)
+        fallback = link.fallback
+        assert fallback is not None
+        query = parse_qs(urlparse(fallback.url).query)
+        self.assertEqual(query.get("alt"), ["media"])
+        self.assertEqual(query.get("key"), ["test-key"])
+        self.assertNotIn("Authorization", fallback.headers)
+
+    def test_google_public_fallback_uses_login_without_key(self) -> None:
+        provider = GoogleProvider(None, FakeOAuth(), self.cache, self.config)
+        link = asyncio.run(provider.resolve_download(
+            self._google_file(source=SourceKind.PUBLIC)))
+        self.assertIsNotNone(link.fallback)
+        fallback = link.fallback
+        assert fallback is not None
+        self.assertEqual(fallback.headers.get("Authorization"), "Bearer secret-token")
+
+    def test_google_public_listing_uses_login_without_key(self) -> None:
+        """«Войдите в аккаунт» должно работать и для публичной ссылки."""
+        from app.providers.base import BrowseContext
+
+        provider = GoogleProvider(None, FakeOAuth(), self.cache, self.config)
+        headers = asyncio.run(provider._headers(BrowseContext(source=SourceKind.PUBLIC)))
+        self.assertEqual(headers.get("Authorization"), "Bearer secret-token")
 
     def test_google_export_has_mime_type(self) -> None:
         provider = GoogleProvider(None, FakeOAuth(), self.cache, self.config)  # type: ignore[arg-type]

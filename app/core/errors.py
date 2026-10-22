@@ -114,6 +114,16 @@ _BODY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
      "Файл не найден. Возможно, его удалили, переместили или закрыли доступ."),
     (re.compile(r"UnauthorizedError|need authorization|требуется авторизация", re.I),
      "Нужен вход в аккаунт. Войдите и повторите."),
+    (re.compile(r"downloadQuotaExceeded|download quota.*exceeded", re.I),
+     "Google временно запретил скачивание этого файла: слишком много скачиваний. "
+     "Попробуйте позже или скачайте его через браузер."),
+    (re.compile(r"cannotDownloadAbusiveFile|acknowledgeAbuse", re.I),
+     "Google пометил файл как подозрительный и не отдаёт его через API. "
+     "Скачайте его через браузер."),
+    (re.compile(r"cannotDownloadFile|downloadRestricted|fileNotDownloadable", re.I),
+     "Владелец файла запретил его скачивание."),
+    (re.compile(r"does not have sufficient permissions", re.I),
+     "Нет доступа к этому файлу. Попросите владельца открыть его вам."),
     (re.compile(r"quota\s*exceeded", re.I), "Достигнут дневной лимит запросов к Google. Зайдите позже."),
     (re.compile(r"rateLimitExceeded", re.I), "Облако временно ограничило частоту запросов. Подождём и продолжим."),
     (re.compile(r"userRateLimitExceeded", re.I), "Облако временно ограничило запросы для вашего аккаунта. Подождём и продолжим."),

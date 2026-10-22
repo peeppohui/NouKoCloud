@@ -8,8 +8,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import httpx
+
 from app.core.config import AppConfig
-from app.core.models import CloudFile, DownloadJob, EntryKind, ProviderId, Segment
+from app.core.models import CloudFile, DownloadJob, DownloadLink, EntryKind, ProviderId, Segment
 from app.downloader.state import load_state, save_state
 from app.downloader.transfer import Transfer, TransferContext
 from app.net.http_client import HttpClient
@@ -18,6 +20,7 @@ from app.net.ratelimit import RateLimiter
 from .helpers import RangeHandler, reset_handler_counters, start_range_server, stop_server
 
 PAYLOAD = bytes((i * 37 + 11) % 256 for i in range(3 * 1024 * 1024 + 4321))
+QUOTA_BODY = b'{"error":{"message":"The download quota for this file has been exceeded"}}'
 
 
 class FakeProvider:
@@ -81,6 +84,60 @@ def make_job(tmp: Path) -> DownloadJob:
     job = DownloadJob(file=file, dest_dir=tmp)
     job.pause_event.set()
     return job
+
+
+class FakeStreamResponse:
+    def __init__(self, status: int, url: str, body: bytes = b"",
+                 headers: dict[str, str] | None = None) -> None:
+        self.status_code = status
+        self._body = body
+        self.headers = headers or {}
+        self.request = httpx.Request("GET", url)
+
+    async def aread(self) -> bytes:
+        return self._body
+
+    async def aiter_bytes(self, _chunk: int):
+        yield self._body
+
+    async def aclose(self) -> None:
+        return None
+
+
+class FakeDownloadHttp:
+    """Первый адрес отвечает ошибкой, резервный — отдаёт файл."""
+
+    def __init__(self, primary: str, body: bytes, *, status: int = 403,
+                 error_type: str = "application/json",
+                 error_body: bytes = QUOTA_BODY) -> None:
+        self.primary = primary
+        self.body = body
+        self.status = status
+        self.error_type = error_type
+        self.error_body = error_body
+        self.urls: list[str] = []
+
+    async def stream(self, _method: str, url: str, **_kwargs):
+        self.urls.append(url)
+        if url == self.primary:
+            return FakeStreamResponse(
+                self.status, url, self.error_body, {"content-type": self.error_type}
+            )
+        return FakeStreamResponse(200, url, self.body, {"content-type": "video/mp4"})
+
+
+class FallbackProvider(FakeProvider):
+    def __init__(self, primary: str, fallback: str) -> None:
+        super().__init__(primary)
+        self.fallback = fallback
+
+    async def resolve_download(self, file: CloudFile) -> DownloadLink:
+        return DownloadLink(
+            url=self.url,
+            headers={},
+            size=file.size,
+            fallback=DownloadLink(url=self.fallback, headers={}, size=file.size),
+        )
 
 
 class TestTransfer(unittest.IsolatedAsyncioTestCase):
@@ -265,6 +322,52 @@ class TestTransfer(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(RangeHandler.max_in_flight, 1, "сегменты должны идти параллельно")
         self.assertLessEqual(RangeHandler.max_in_flight, 2,
                              "но не больше, чем разрешено настройкой")
+
+    def _fallback_transfer(self, config: AppConfig, fake_http: FakeDownloadHttp,
+                           primary: str, fallback: str) -> Transfer:
+        return Transfer(TransferContext(
+            http=fake_http,  # type: ignore[arg-type]
+            registry=FakeRegistry(FallbackProvider(primary, fallback)),  # type: ignore[arg-type]
+            config=config,
+            streams_semaphore=asyncio.Semaphore(8),
+            on_progress=lambda _job: None,
+        ))
+
+    async def test_403_switches_to_fallback_link(self) -> None:
+        """403 от основного адреса — сразу пробуем резервный, без паузы."""
+        config = make_config(self.tmp, use_segments=False)
+        job = make_job(self.tmp)
+        primary = "https://primary.test/file"
+        fallback = "https://fallback.test/file"
+        fake_http = FakeDownloadHttp(primary, PAYLOAD)
+        transfer = self._fallback_transfer(config, fake_http, primary, fallback)
+
+        with self.assertLogs("app.downloader.transfer", level="INFO") as logs:
+            ok = await transfer.run(job)
+
+        self.assertTrue(ok)
+        self.assertEqual((self.tmp / "test.mp4").read_bytes(), PAYLOAD)
+        self.assertEqual(fake_http.urls[:2], [primary, fallback])
+        self.assertIn("download quota", "\n".join(logs.output),
+                      "тело 403 должно попасть в журнал")
+
+    async def test_html_instead_of_file_switches_to_fallback(self) -> None:
+        """HTML-заглушка Google — тоже повод перейти на резервную ссылку."""
+        config = make_config(self.tmp, use_segments=False)
+        job = make_job(self.tmp)
+        primary = "https://primary.test/file"
+        fallback = "https://fallback.test/file"
+        fake_http = FakeDownloadHttp(
+            primary, PAYLOAD, status=200, error_type="text/html",
+            error_body=b"<html><body>download quota</body></html>",
+        )
+        transfer = self._fallback_transfer(config, fake_http, primary, fallback)
+
+        ok = await transfer.run(job)
+
+        self.assertTrue(ok)
+        self.assertEqual((self.tmp / "test.mp4").read_bytes(), PAYLOAD)
+        self.assertEqual(fake_http.urls[:2], [primary, fallback])
 
 
 if __name__ == "__main__":
