@@ -31,7 +31,8 @@ class TestYandexOAuth(unittest.TestCase):
         self.assertNotIn("scope", params)
 
     def test_redirect_uri_is_verification_code(self) -> None:
-        self.assertEqual(REDIRECT_URIS[0], "https://oauth.yandex.com/verification_code")
+        self.assertEqual(REDIRECT_URIS[0], "https://oauth.yandex.ru/verification_code")
+        self.assertIn("https://oauth.yandex.com/verification_code", REDIRECT_URIS)
 
     def test_code_must_be_digits(self) -> None:
         import asyncio

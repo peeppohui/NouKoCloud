@@ -1,9 +1,10 @@
 """OAuth Яндекса (консольное приложение: код подтверждения вводит пользователь).
 
 Сверено с официальной документацией (https://yandex.ru/dev/id/doc/en/):
-* адрес выдачи кода — `https://oauth.yandex.com/verification_code`;
+* адрес выдачи кода — `https://oauth.yandex.ru/verification_code`;
   именно его надо указать в поле «Redirect URI» приложения
-  (для приложений «For API access» он задан жёстко и не меняется);
+  (для приложений «For API access» он задан жёстко и не меняется;
+  у старых приложений встречается `.com` — он оставлен запасным);
 * код подтверждения живёт 10 минут; раньше это были 7 цифр, сейчас —
   строка из латинских букв и цифр;
 * если `scope` не передавать, токен выдаётся с теми правами,
@@ -35,9 +36,11 @@ TOKEN_URL = "https://oauth.yandex.com/token"
 INFO_URL = "https://login.yandex.ru/info?format=json"
 
 #: Куда Яндекс перенаправляет пользователя, показав код.
+#: Основной адрес — `.ru`: его Яндекс выдаёт при регистрации приложения.
+#: `.com` оставлен для старых приложений, где был прописан именно он.
 REDIRECT_URIS = (
-    "https://oauth.yandex.com/verification_code",
     "https://oauth.yandex.ru/verification_code",
+    "https://oauth.yandex.com/verification_code",
     "https://oauth.yandex.ru/redirect",
 )
 
