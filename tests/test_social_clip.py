@@ -28,6 +28,10 @@ class TestTime(unittest.TestCase):
         self.assertEqual(social.format_time(75), "1:15")
         self.assertEqual(social.format_time(3750), "1:02:30")
         self.assertNotIn(":", social.clip_label(65, 100))     # двоеточие в именах Windows нельзя
+        # Метка не должна выглядеть как десятичная дробь: 2–5 секунд — это
+        # «00-02–00-05», а не «0.02–0.05».
+        self.assertEqual(social.clip_label(2, 5), "00-02–00-05")
+        self.assertEqual(social.clip_label(60, 90), "01-00–01-30")
 
 
 class TestClipOptions(unittest.TestCase):
@@ -35,7 +39,7 @@ class TestClipOptions(unittest.TestCase):
         opts = social.build_options(Path("D:/x"), "video", section=(60, 90), precise=True)
         self.assertIn("download_ranges", opts)
         self.assertTrue(opts["force_keyframes_at_cuts"])
-        self.assertIn("[1.00–1.30]", opts["outtmpl"])           # не затрёт целое видео
+        self.assertIn("[01-00–01-30]", opts["outtmpl"])           # не затрёт целое видео
         self.assertIn("libx264", opts["external_downloader_args"]["ffmpeg_o"])
 
     def test_fast_cut_and_audio(self) -> None:

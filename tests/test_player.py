@@ -189,8 +189,12 @@ class TestBufferingGate(PlayerTestBase):
         self.player._audio.setMuted(True)
         self.player.play(url, "audio", "voice.wav", buffer_probe=lambda _f: state["value"])
         mp = self.player._player
-        self.assertTrue(wait_until(lambda: mp.duration() > 0), "плеер не открыл файл")
-        self.player._buffer_timer.stop()   # управляем проверками вручную
+        # Таймер буфера останавливаем СРАЗУ: иначе он успеет сработать, пока
+        # ждём загрузку, и решит, что буфера мало, — тест станет зависеть от
+        # того, успел ли таймер.
+        self.player._buffer_timer.stop()
+        self.player._buffering = False
+        self.assertTrue(wait_until(lambda: mp.duration() > 0), "плеер не загрузил")
         size = len(make_wav(4.0))
         state["size"] = size
         return state

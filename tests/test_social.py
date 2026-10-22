@@ -1,4 +1,4 @@
-"""Вкладка «Соцсети»: параметры yt-dlp, понятные ошибки, сценарий страницы (без сети)."""
+﻿"""Вкладка «Соцсети»: параметры yt-dlp, понятные ошибки, сценарий страницы (без сети)."""
 
 from __future__ import annotations
 
@@ -31,6 +31,33 @@ def pump_until(cond, limit=5.0) -> bool:
             return True
         time.sleep(0.01)
     return False
+
+
+def tiny_mp4() -> bytes:
+    """Крошечный настоящий ролик.
+
+    Подделка не годится: ffprobe должен её разобрать, иначе yt-dlp падает
+    на постобработке, а проверить мы хотим именно скачивание.
+    """
+    import shutil
+    import subprocess
+
+    from app.core.paths import bundled_ffmpeg
+
+    ffmpeg = bundled_ffmpeg() or shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise unittest.SkipTest("ffmpeg не найден — ролик не сгенерировать")
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "tiny.mp4"
+        subprocess.run(
+            [str(ffmpeg), "-y", "-loglevel", "error",
+             "-f", "lavfi", "-i", "color=c=black:s=64x64:d=1",
+             "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
+             str(out)],
+            check=True, capture_output=True,
+        )
+        return out.read_bytes()
 
 
 class TestOptions(unittest.TestCase):
@@ -143,12 +170,106 @@ class TestSocialPage(unittest.TestCase):
         self.assertEqual(row.status.text(), "Видео закрыто")
 
     def test_bad_link_shows_message(self) -> None:
-        with mock.patch.object(social, "probe", side_effect=social.SocialError("Этот сайт не поддерживается")):
+        with mock.patch.object(social, "probe", side_effect=social.SocialError("нет такой ссылки")):
             self.page.link_edit.setText("https://example.com")
             self.page.find()
-            self.assertTrue(pump_until(lambda: "не поддерживается" in self.page.status.text()))
+            self.assertTrue(pump_until(lambda: "нет такой ссылки" in self.page.status.text()))
         self.assertFalse(self.page.card.isVisibleTo(self.page))
+
+
+class TestPiecesDownload(unittest.TestCase):
+    """Скачивание обычного файла частями по Range.
+    Раньше файл превращался в «нарезанный» DASH, но yt-dlp про Range в таких
+    частях не знает: каждая часть тянулась целиком, а потом они склеивались
+    подряд — на выходе был файл в N раз больше нужного, и ролик на 2 ГБ
+    качался две тысячи раз, то есть никогда.
+    """
+
+    def test_dl_returns_pair(self) -> None:
+        """yt-dlp ждёт от dl() пару (успех, real_download)."""
+        from .helpers import start_range_server, stop_server
+
+        payload = bytes((i * 31 + 7) % 256 for i in range(200 * 1024))
+        handler, thread, server = start_range_server(payload)
+        try:
+            url = f"http://127.0.0.1:{server.server_address[1]}/movie.mp4"
+            with tempfile.TemporaryDirectory() as tmp:
+                target = str(Path(tmp) / "movie.mp4")
+                ydl_cls = social._yt_class()
+                opts = {"quiet": True, "no_warnings": True, "noprogress": True,
+                        "outtmpl": target, "paths": {"home": tmp}}
+                with ydl_cls(opts) as ydl:
+                    info = {"url": url, "ext": "mp4", "protocol": "https",
+                            "filesize": len(payload), "http_headers": {},
+                            "extractor_key": "Test"}
+                    result = ydl.dl(target, info)
+                self.assertIsInstance(result, tuple, "dl() должен вернуть пару")
+                self.assertEqual(len(result), 2)
+                self.assertTrue(result[0], "загрузка должна быть успешной")
+                data = Path(target).read_bytes()
+                self.assertEqual(len(data), len(payload), "размер должен совпасть")
+                self.assertEqual(data, payload, "части должны лечь на свои места")
+        finally:
+            stop_server(server)
+
+    def test_pieces_fall_back_when_range_not_supported(self) -> None:
+        """Сервер без Range — качаем обычным способом, а не падаем."""
+        from .helpers import start_range_server, stop_server
+
+        payload = b"x" * 4096
+        handler, thread, server = start_range_server(payload)
+        try:
+            handler.payload = payload
+            url = f"http://127.0.0.1:{server.server_address[1]}/movie.mp4"
+            with tempfile.TemporaryDirectory() as tmp:
+                target = str(Path(tmp) / "movie.mp4")
+                ydl_cls = social._yt_class()
+                opts = {"quiet": True, "no_warnings": True, "noprogress": True,
+                        "outtmpl": target, "paths": {"home": tmp}}
+                with ydl_cls(opts) as ydl:
+                    info = {"url": url, "ext": "mp4", "protocol": "https",
+                            "filesize": len(payload), "http_headers": {},
+                            "extractor_key": "Test"}
+                    result = ydl.dl(target, info)
+                self.assertTrue(result[0])
+        finally:
+            stop_server(server)
+
+    def test_whole_way_through_the_page(self) -> None:
+        """Страница «Соцсети» находит ролик и кладёт файл на диск.
+
+        С настоящим разбором и настоящим скачиванием, но по локальному
+        серверу — сеть не нужна.
+        """
+        from .helpers import start_range_server, stop_server
+
+        # Настоящий короткий ролик: иначе ffprobe не сможет его разобрать
+        # и yt-dlp ругнётся на постобработке.
+        video = tiny_mp4()
+        handler, thread, server = start_range_server(video)
+        try:
+            url = f"http://127.0.0.1:{server.server_address[1]}/movie.mp4"
+            with tempfile.TemporaryDirectory() as tmp:
+                from app.ui.social_page import SocialPage
+
+                page = SocialPage(lambda: Path(tmp))
+                page.link_edit.setText(url)
+                page.find()
+                self.assertTrue(pump_until(lambda: page.card.isVisibleTo(page)),
+                                "ролик не нашёлся")
+                page.start_download()
+                row = next(iter(page._rows.values()))
+                self.assertTrue(pump_until(lambda: row.path is not None, 60),
+                                "файл не скачался")
+                self.assertTrue(Path(row.path).exists())
+                # Размер может отличаться от исходного: видео и звук
+                # склеиваются заново.
+                self.assertGreater(Path(row.path).stat().st_size, 0)
+        finally:
+            stop_server(server)
 
 
 if __name__ == "__main__":
     unittest.main()
+
+

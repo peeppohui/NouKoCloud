@@ -58,16 +58,37 @@ class TestInstantCancel(unittest.IsolatedAsyncioTestCase):
 
 class TestSocialPieces(unittest.TestCase):
     def test_pieces_cover_whole_file(self) -> None:
-        info = {"url": "https://x/v.mp4", "protocol": "https", "downloader_options": {"http_chunk_size": 1}}
+        """Части должны покрывать файл целиком — без дыр и нахлёстов."""
         size = 5 * 1024 * 1024 + 123
-        out = social.split_into_pieces(info, size, piece=1024 * 1024)
-        self.assertEqual(out["protocol"], "http_dash_segments")
-        self.assertNotIn("downloader_options", out)
-        ranges = [f["byte_range"] for f in out["fragments"]]
-        self.assertEqual(ranges[0]["start"], 0)
-        self.assertEqual(ranges[-1]["end"], size)
+        ranges = social.split_ranges(size, piece=1024 * 1024)
+        self.assertEqual(ranges[0][0], 0)
+        self.assertEqual(ranges[-1][1], size - 1)
         for a, b in zip(ranges, ranges[1:]):
-            self.assertEqual(a["end"], b["start"])        # без дыр и нахлёстов
+            self.assertEqual(a[1] + 1, b[0])        # без дыр и нахлёстов
+
+    def test_pieces_write_at_their_own_places(self) -> None:
+        """Часть пишется на своё место — иначе файл получится из копий.
+
+        Раньше части отдавались yt-dlp как «нарезанный» DASH: тот про
+        Range не знает и тянул целиком каждую часть, а потом склеивал их
+        подряд — на выходе был файл в N раз больше нужного.
+        """
+        import tempfile
+
+        from .helpers import start_range_server, stop_server
+
+        payload = bytes((i * 37 + 11) % 256 for i in range(300 * 1024))
+        handler, thread, server = start_range_server(payload)
+        try:
+            url = f"http://127.0.0.1:{server.server_address[1]}/file.bin"
+            with tempfile.TemporaryDirectory() as tmp:
+                target = str(Path(tmp) / "part.bin")
+                social._download_ranges(url, {}, len(payload), 64 * 1024, target, 4, [], None)
+                data = Path(target).read_bytes()
+                self.assertEqual(len(data), len(payload), "размер должен совпасть")
+                self.assertEqual(data, payload, "части должны лечь на свои места")
+        finally:
+            stop_server(server)
 
     def test_cancel_is_not_swallowed_by_ytdlp(self) -> None:
         # yt-dlp ловит Exception — отмена должна пролетать мимо.

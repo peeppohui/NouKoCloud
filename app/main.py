@@ -33,6 +33,13 @@ def main(argv: list[str] | None = None) -> int:
         "заданы" if config.google_client_id else "не заданы",
     )
 
+    # ffmpeg лежит в папке bin рядом с программой — без него не склеить
+    # видео со звуком. Пишем адрес: сразу видно, если он не нашёлся.
+    from .core.paths import bundled_ffmpeg
+
+    ffmpeg = bundled_ffmpeg()
+    log.info("ffmpeg: %s", ffmpeg or "не найден (видео со звуком не склеить)")
+
     if "--reset-tokens" in argv:
         from .core.secrets_store import TokenStore
 

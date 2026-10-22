@@ -9,20 +9,22 @@ yt-dlp склеивает их с помощью ffmpeg (bin/ffmpeg.exe рядо
 
 Скорость. YouTube (и не только) ограничивает каждое соединение — из России
 это бывает ~70 КБ/с. Поэтому файл качается частями по PIECE байт во много
-соединений одновременно: обычный файл превращаем в «нарезанный» (как DASH),
-и yt-dlp сам качает части параллельно (_FastYDL.dl). Замер на YouTube:
-1 соединение — 0,06 МБ/с, 16 — 1 МБ/с, 64 — 5 МБ/с.
+соединений одновременно: части тянутся параллельно и пишутся каждая на своё
+место (_dl_pieces). Замер на YouTube: 1 соединение — 0,06 МБ/с, 16 — 1 МБ/с,
+64 — 5 МБ/с.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import subprocess
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -110,7 +112,7 @@ _ERRORS = (
      "Видео только для подписчиков или платное — скачать его нельзя."),
     (r"DRM|protected",
      "Видео защищено от копирования (DRM) — скачать его нельзя."),
-    (r"ffmpeg|ffprobe",
+    (r"ffmpeg not found|Unable to find ffmpeg|ffprobe not found|ffmpeg.*not found",
      "Не найден ffmpeg — он нужен, чтобы склеить видео со звуком. "
      "Переустановите программу (ffmpeg лежит в папке bin рядом с ней)."),
     (r"timed out|Connection|Network|getaddrinfo|Temporary failure",
@@ -121,6 +123,10 @@ _ERRORS = (
 
 
 def friendly(exc: BaseException) -> str:
+    # SocialError уже несёт человеческий текст — не заменяем его общим
+    # «не удалось скачать»: пользователь должен видеть причину.
+    if isinstance(exc, SocialError):
+        return str(exc)
     text = re.sub(r"\x1b\[[0-9;]*m", "", str(exc))   # убираем цветовые коды yt-dlp
     for pattern, message in _ERRORS:
         if re.search(pattern, text, re.I):
@@ -152,31 +158,106 @@ def _base_options() -> dict:
     }
 
 
-def split_into_pieces(info: dict, size: int, piece: int = 0) -> dict:
-    """Обычный файл -> «нарезанный»: части с Range, их yt-dlp качает параллельно."""
+def split_ranges(size: int, piece: int = 0) -> list[tuple[int, int]]:
+    """Диапазоны частей файла: [(начало, конец), …] — без дыр и перекрытий."""
     piece = piece or PIECE
-    fragments = [{"url": info["url"], "byte_range": {"start": start, "end": min(start + piece, size)}}
-                 for start in range(0, size, piece)]
-    out = {**info, "protocol": "http_dash_segments", "fragments": fragments}
-    out.pop("fragment_base_url", None)
-    out.pop("downloader_options", None)
-    return out
+    ranges: list[tuple[int, int]] = []
+    start = 0
+    while start < size:
+        end = min(start + piece, size) - 1
+        ranges.append((start, end))
+        start = end + 1
+    return ranges
+
+
+def _remove(path: str) -> None:
+    """Убирает временный файл (мог остаться после обрыва)."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _download_ranges(url: str, headers: dict, size: int, piece: int, target: str,
+                     connections: int, hooks: list, cancel: threading.Event | None) -> None:
+    """Качает файл частями по Range, каждая часть пишется на своё место.
+
+    Части тянутся в нескольких потоках, порядок не важен — пишем по
+    смещениям. Сервер без поддержки Range отдаёт 200 вместо 206: тогда
+    выбрасываем исключение, и вызывающий качает файл обычным способом.
+    """
+    import httpx
+
+    ranges = split_ranges(size, piece)
+    # Файл заранее растягиваем на весь размер — части пишут в свои места.
+    with open(target, "wb") as handle:
+        handle.truncate(size)
+
+    lock = threading.Lock()
+    state = {"done": 0, "started": time.monotonic(), "speed": 0.0}
+    errors: list[BaseException] = []
+
+    def report() -> None:
+        now = time.monotonic()
+        with lock:
+            done = state["done"]
+            elapsed = now - state["started"]
+            if elapsed > 0:
+                current = done / elapsed
+                state["speed"] = current if not state["speed"] else 0.7 * state["speed"] + 0.3 * current
+            speed = state["speed"]
+        status = {
+            "status": "downloading",
+            "downloaded_bytes": done,
+            "total_bytes": size,
+            "speed": speed,
+            "eta": (size - done) / speed if speed > 0 else None,
+        }
+        for hook in hooks:
+            try:
+                hook(status)
+            except BaseException:
+                return          # отмена: хук бросает Cancelled — просто выходим
+
+    def worker(rng: tuple[int, int]) -> None:
+        begin, end = rng
+        want = end - begin + 1
+        got = 0
+        try:
+            request = {**headers, "Range": f"bytes={begin}-{end}"}
+            with httpx.Client(follow_redirects=True, timeout=30.0) as client:
+                with client.stream("GET", url, headers=request) as response:
+                    if response.status_code != 206:
+                        raise IOError(f"сервер не поддержал диапазон (код {response.status_code})")
+                    offset = begin
+                    with open(target, "r+b") as handle:
+                        for chunk in response.iter_bytes(256 * 1024):
+                            if cancel is not None and cancel.is_set():
+                                raise Cancelled()
+                            handle.seek(offset)
+                            handle.write(chunk)
+                            offset += len(chunk)
+                            got += len(chunk)
+                            with lock:
+                                state["done"] += len(chunk)
+                            report()
+            if got != want:
+                # Часть пришла короче — в файле останется дыра из нулей.
+                raise IOError(f"часть {begin}-{end} пришла на {got} байт вместо {want}")
+        except BaseException as exc:
+            with lock:
+                errors.append(exc)
+
+    with ThreadPoolExecutor(max_workers=max(1, connections)) as pool:
+        list(pool.map(worker, ranges))
+    if errors:
+        raise errors[0]
+    report()
 
 
 def _yt_class():
     import yt_dlp
-    from yt_dlp.downloader.dash import DashSegmentsFD
     from yt_dlp.networking import Request
-
-    class _PiecesFD(DashSegmentsFD):
-        """Части одного файла по Range (DashSegmentsFD сам byte_range не передаёт)."""
-
-        FD_NAME = "pieces"
-
-        def _get_fragments(self, fmt, ctx, extra_query):
-            for fragment in super()._get_fragments(fmt, ctx, extra_query):
-                fragment["byte_range"] = fmt["fragments"][fragment["index"]]["byte_range"]
-                yield fragment
 
     class _FastYDL(yt_dlp.YoutubeDL):
         """YoutubeDL, который качает обычные файлы в несколько соединений."""
@@ -199,19 +280,34 @@ def _yt_class():
                 size = info.get("filesize") or self._content_length(info)
                 if size and size > PIECE * 2:
                     log.debug("Соцсети: формат %s качаем частями (%d МБ)", info.get("format_id"), size >> 20)
-                    return self._dl_pieces(name, split_into_pieces(info, int(size)))
+                    return self._dl_pieces(name, info, int(size))
             return super().dl(name, info, subtitle, test)
 
-        def _dl_pieces(self, name, info):
-            # То же, что YoutubeDL.dl, но с нашим загрузчиком частей.
+        def _dl_pieces(self, name, info, size: int):
+            """Обычный файл — в несколько соединений, части пишутся по местам.
+
+            Раньше здесь был обман: файл превращался в «нарезанный» (DASH),
+            но yt-dlp про Range в таких частях не знает и тянул ЦЕЛИКОМ каждую
+            часть. Ролик на 2 ГБ качался 2000 раз — и не заканчивался никогда.
+            Теперь части тянутся по Range и пишутся на свои места.
+            """
+            url = info.get("url")
+            headers = info.get("http_headers") or {}
             many = YOUTUBE_CONNECTIONS if "youtube" in str(info.get("extractor_key", "")).lower() else CONNECTIONS
-            fd = _PiecesFD(self, {**self.params, "concurrent_fragment_downloads": many})
-            for hook in self._progress_hooks:
-                fd.add_progress_hook(hook)
-            new_info = self._copy_infodict(info)
-            if new_info.get("http_headers") is None:
-                new_info["http_headers"] = self._calc_headers(new_info)
-            return fd.download(name, new_info)
+            part = f"{name}.part"
+            try:
+                _download_ranges(url, headers, size, PIECE, part, many,
+                                 self._progress_hooks, self.cancel)
+            except Cancelled:
+                _remove(part)
+                raise
+            except Exception as exc:
+                _remove(part)
+                log.debug("Соцсети: частями не вышло (%s) — качаем одним потоком", exc)
+                return super().dl(name, info)
+            os.replace(part, name)
+            # yt-dlp ждёт пару (успех, real_download) — как у его загрузчиков.
+            return True, True
 
         def _dl_section(self, name, info):
             """Фрагмент: его вырезает ffmpeg, а качает посредник во много соединений."""
@@ -408,8 +504,20 @@ def quality_choices(info: MediaInfo) -> list[int]:
 # Скачивание
 # ----------------------------------------------------------------------
 def clip_label(start: float, end: float) -> str:
-    """«1.05–1.40» — для имени файла (двоеточие в именах Windows нельзя)."""
-    return f"{format_time(start).replace(':', '.')}–{format_time(end).replace(':', '.')}"
+    """«02-05» — метки времени в имени файла (двоеточие в Windows нельзя).
+
+    Без ведущих нулей минут: «0.02–0.05» читалось бы как две десятых
+    секунды, а не как две и пять секунд.
+    """
+
+    def part(seconds: float) -> str:
+        tenths = int(round(max(0.0, seconds) * 10))
+        total = tenths // 10
+        h, rest = divmod(total, 3600)
+        m, s = divmod(rest, 60)
+        return f"{h}-{m:02d}-{s:02d}" if h else f"{m:02d}-{s:02d}"
+
+    return f"{part(start)}–{part(end)}"
 
 
 def format_time(seconds: float, precise: bool = False) -> str:
