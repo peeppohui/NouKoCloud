@@ -6,6 +6,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -14,6 +15,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from app.core.config import AppConfig  # noqa: E402
 from app.core.models import CloudFile, EntryKind, ProviderId, SourceKind  # noqa: E402
+from app.core.update_check import ReleaseInfo  # noqa: E402
 from app.context import build_context  # noqa: E402
 from app.providers.base import BrowseContext  # noqa: E402
 from app.ui.main_window import MainWindow  # noqa: E402
@@ -164,6 +166,28 @@ class TestMainWindow(unittest.TestCase):
         self.win._restore_geometry()
         self.assertEqual(self.win.size().width(), 760)
         self.assertEqual(self.win.size().height(), 600)
+
+    def test_new_release_opens_browser_once(self) -> None:
+        """Новый релиз открывается в браузере, повторно — уже нет."""
+        class Done:
+            def result(self_inner):
+                return ReleaseInfo(
+                    "9.9.9",
+                    "https://github.com/peeppohui/NouKoCloud/releases/tag/v9.9.9",
+                )
+
+        self.win._update_check_running = True
+        with patch.object(self.win, "_open_release_page", return_value=True) as opened:
+            self.win._after_update_check(Done())
+        opened.assert_called_once_with(
+            "https://github.com/peeppohui/NouKoCloud/releases/tag/v9.9.9")
+        self.assertEqual(self.ctx.config.last_update_notified, "9.9.9")
+        self.assertGreater(self.ctx.config.last_update_check, 0)
+        self.assertFalse(self.win._update_check_running)
+
+        with patch.object(self.win, "_open_release_page", return_value=True) as opened:
+            self.win._after_update_check(Done())
+        opened.assert_not_called()
 
 
 if __name__ == "__main__":

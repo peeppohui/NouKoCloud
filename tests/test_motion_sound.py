@@ -132,6 +132,18 @@ class TestSettingsToggles(unittest.TestCase):
             dialog._save()
             self.assertEqual(config.ui_volume, 25)
 
+    def test_update_check_saved(self) -> None:
+        from app.ui.settings_dialog import SettingsDialog
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig()
+            config.download_dir = tmp
+            dialog = SettingsDialog(config)
+            self.assertTrue(dialog._update_check.isChecked())
+            dialog._update_check.setChecked(False)
+            dialog._save()
+            self.assertFalse(config.update_check_on_start)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import sys
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QApplication
 
 from .context import build_context
@@ -87,6 +87,10 @@ def main(argv: list[str] | None = None) -> int:
         window.show()
     if start_url:
         window.open_link_at_startup(start_url)
+
+    # Автозапуск в фоне не должен неожиданно открывать браузер.
+    if not background and config.update_check_on_start:
+        QTimer.singleShot(5000, window.check_for_updates)
 
     try:
         return app.exec()

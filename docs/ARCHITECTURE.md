@@ -50,6 +50,7 @@ SQLite (кэш) / PyInstaller (сборка). Зависимостей ровн�
 | Ядро | `app/core/models.py` | `CloudFile`, `DownloadJob`, `Segment`, `DownloadLink` — общий язык всех слоёв |
 | Ядро | `app/core/errors.py` | Единая точка превращения исключений в **человеческие** фразы для UI |
 | Ядро | `app/core/config.py` | Настройки в `%APPDATA%\NoukoCloud\config.json`, переопределение через env |
+| Ядро | `app/core/update_check.py` | Проверка GitHub Releases: версия и ссылка на новый релиз |
 | Ядро | `app/core/secrets_store.py` | Токены, зашифрованные DPAPI (привязка к пользователю Windows) |
 | Ядро | `app/core/async_runtime.py` | Event loop в отдельном потоке + `run_coroutine_threadsafe` |
 | Ядро | `app/core/bus.py` | Шина сигналов Qt между потоками |

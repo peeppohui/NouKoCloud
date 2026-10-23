@@ -67,6 +67,14 @@ class TestPortableConfig(unittest.TestCase):
         cfg = AppConfig()
         self.assertIsInstance(cfg, AppConfig)
 
+    def test_update_check_can_be_disabled(self) -> None:
+        """false в файле — это значение, а не «пусто»: проверка выключается."""
+        user = self.tmp / "user.json"
+        user.write_text(json.dumps({"update_check_on_start": False}), encoding="utf-8")
+        cfg = AppConfig()
+        cfg._apply_file(user)
+        self.assertFalse(cfg.update_check_on_start)
+
 
 class TestRenameMigration(unittest.TestCase):
     """После переименования svsCloud → НоуКо Cloud ключи и вход не теряются."""

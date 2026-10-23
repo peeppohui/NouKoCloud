@@ -146,6 +146,21 @@ class SettingsDialog(OverlayDialog):
             self._autostart.setToolTip("Доступно в собранной программе (NoukoCloud.exe)")
         bg.addWidget(self._autostart)
         left.addWidget(bg_box)
+
+        updates_box = QGroupBox("ОБНОВЛЕНИЯ", self.body)
+        updates = QVBoxLayout(updates_box)
+        updates.setSpacing(12)
+        self._update_check = QCheckBox("Сообщать о новой версии", updates_box)
+        self._update_check.setChecked(bool(getattr(config, "update_check_on_start", True)))
+        self._update_check.setToolTip(
+            "При запуске программа проверит GitHub. Если вышла более новая версия, "
+            "откроется её страница в браузере — один раз на версию."
+        )
+        updates.addWidget(self._update_check)
+        updates.addWidget(label(
+            "Это только уведомление: программу можно обновить вручную.",
+            "hint", updates_box, wrap=True))
+        left.addWidget(updates_box)
         columns.addLayout(left, 1)
 
         right = QVBoxLayout()
@@ -449,6 +464,7 @@ class SettingsDialog(OverlayDialog):
         config.ui_sounds = self._ui_sounds.isChecked()
         config.ui_volume = self._ui_volume.value()
         config.run_in_background = self._run_bg.isChecked()
+        config.update_check_on_start = self._update_check.isChecked()
         if self._autostart.isEnabled() and self._autostart.isChecked() != autostart.enabled():
             autostart.set_enabled(self._autostart.isChecked())
         config.log_level = self._log_level.currentText()

@@ -23,9 +23,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .. import __version__
 from ..context import AppContext
 from ..core.errors import friendly_error
 from ..core.models import CloudFile, ProviderId, SourceKind
+from ..core.update_check import fetch_latest_release, is_check_due, should_notify
 from ..downloader.engine import _safe_name
 from ..core.logging_setup import errors_log_path
 from ..core.paths import logs_dir
@@ -163,6 +165,7 @@ class MainWindow(FramelessWindow, QMainWindow):
         self._build_ui()
         self._connect_bus()
         self._quitting = False
+        self._update_check_running = False
         self.tray: Tray | None = None
         self._setup_background()
         self._on_checked_changed(0)
@@ -456,6 +459,45 @@ class MainWindow(FramelessWindow, QMainWindow):
         for pid in (ProviderId.YANDEX, ProviderId.GOOGLE):
             if self.ctx.oauth.is_logged_in(pid):
                 self._open_my_drive_for(pid, interactive=False)
+
+    # ------------------------------------------------------------------
+    def check_for_updates(self, manual: bool = False) -> None:
+        """Проверяет GitHub в фоне; новый релиз откроет страницу в браузере."""
+        if self._update_check_running:
+            return
+        if not manual and not is_check_due(self.ctx.config.last_update_check):
+            return
+        self._update_check_running = True
+        future = self.ctx.runtime.submit(fetch_latest_release(self.ctx.http.raw))
+        future.add_done_callback(self._in_gui(self._after_update_check))
+
+    def _after_update_check(self, future) -> None:
+        self._update_check_running = False
+        try:
+            release = future.result()
+        except Exception as exc:
+            log.info("Проверка обновлений не удалась: %s", exc)
+            return
+        cfg = self.ctx.config
+        # Запоминаем даже неудачную попытку: иначе каждый запуск без сети
+        # снова ждал бы таймаут GitHub.
+        cfg.last_update_check = time.time()
+        if release is None or not should_notify(release, __version__, cfg.last_update_notified):
+            self._save_config()
+            return
+        cfg.last_update_notified = release.version
+        self._save_config()
+        log.info("Доступна новая версия %s: %s", release.version, release.url)
+        if self._open_release_page(release.url):
+            self._on_notice(
+                "info", f"Вышла новая версия {release.version} — открыли страницу релиза.")
+        else:
+            self._on_notice("warn", f"Вышла новая версия {release.version}: {release.url}")
+
+    @staticmethod
+    def _open_release_page(url: str) -> bool:
+        """Открывает страницу релиза в браузере (отдельный метод — для тестов)."""
+        return QDesktopServices.openUrl(QUrl(url))
 
     def _recover_downloads(self) -> None:
         dest = self.ctx.config.download_dir_path
