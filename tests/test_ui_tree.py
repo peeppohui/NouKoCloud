@@ -174,6 +174,14 @@ class TestFileTree(unittest.TestCase):
         self.assertEqual(asked, [ProviderId.GOOGLE])
         self.assertEqual(drive.child(0).text(), "загрузка…")
 
+    def test_click_on_my_drive_requests_it(self) -> None:
+        """Достаточно одного клика по «Мой диск» — раскрывать вручную не надо."""
+        asked = []
+        self.tree.open_drive_requested.connect(asked.append)
+        drive = self.tree.drive(ProviderId.YANDEX)
+        self.tree._on_clicked(drive.index())
+        self.assertEqual(asked, [ProviderId.YANDEX])
+
     def test_my_drive_failure_allows_retry(self) -> None:
         asked = []
         self.tree.open_drive_requested.connect(asked.append)

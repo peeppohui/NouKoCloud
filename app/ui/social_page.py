@@ -9,7 +9,7 @@ import sys
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QRegularExpression, Qt, QUrl, Signal
+from PySide6.QtCore import QEvent, QObject, QRegularExpression, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QRegularExpressionValidator
 from PySide6.QtWidgets import (
     QApplication,
@@ -234,6 +234,7 @@ class SocialPage(StarsBackground):
         lay.setContentsMargins(24, 22, 24, 24)
         lay.setSpacing(16)
         scroll.setWidget(content)
+        self._scroll = scroll
         left_lay.addWidget(scroll)
 
         lay.addWidget(label("соцсети", "h3", content))
@@ -280,6 +281,10 @@ class SocialPage(StarsBackground):
         card.addWidget(self.title)
         self.meta = label("", "muted", self.card, wrap=True)
         card.addWidget(self.meta)
+        self.warning = label("", "hint", self.card, wrap=True)
+        self.warning.setProperty("error", True)
+        self.warning.setVisible(False)
+        card.addWidget(self.warning)
 
         self.mode = SegmentedTabs(["Видео", "Только звук"], self.card)
         self.mode.changed.connect(self._sync_mode)
@@ -364,8 +369,7 @@ class SocialPage(StarsBackground):
                                  "Shift + ← → — 1 с.", "hint", self.clip_box, wrap=True))
         card.addWidget(self.clip_box)
         self.clip_box.setVisible(False)
-        self.clip.toggled.connect(self.clip_box.setVisible)
-        self.clip.toggled.connect(lambda _on: self._sync_clip())
+        self.clip.toggled.connect(self._on_clip_toggled)
 
         self.btn_download = button("Скачать", "primary", self.card, icon_name="download")
         self.btn_download.clicked.connect(self.start_download)
@@ -489,9 +493,22 @@ class SocialPage(StarsBackground):
         meta = [part for part in (info.site, info.uploader, info.duration_text) if part]
         self.meta.setText(" · ".join(meta))
         self.player.show_message("Готовим предпросмотр…")
+        if info.warning:
+            self.warning.setText(
+                "YouTube не отдал часть форматов: не установлен JavaScript-движок. "
+                "Выше 720p может не скачаться — если так, выберите 720p."
+            )
+            self.warning.setToolTip(info.warning)
+            self.warning.setVisible(True)
+        else:
+            self.warning.setVisible(False)
+            self.warning.clear()
         self.quality.clear()
         for height in social.quality_choices(info):
-            self.quality.addItem(quality_text(height), height)
+            text = quality_text(height)
+            if info.warning and height >= 1080:
+                text += " · может не скачаться"
+            self.quality.addItem(text, height)
         if not info.has_video:
             self.mode.set_current(1)
             self._sync_mode(1)
@@ -634,6 +651,14 @@ class SocialPage(StarsBackground):
         if end <= start:
             return "Конец должен быть позже начала"
         return start, end
+
+    def _on_clip_toggled(self, enabled: bool) -> None:
+        self.clip_box.setVisible(enabled)
+        self._sync_clip()
+        if enabled:
+            # Поля фрагмента выталкивают «Скачать» ниже видимой области —
+            # прокручиваем к кнопке, чтобы её не приходилось искать.
+            QTimer.singleShot(0, lambda: self._scroll.ensureWidgetVisible(self.btn_download, 0, 16))
 
     def _sync_clip(self) -> None:
         if not self.clip.isChecked():

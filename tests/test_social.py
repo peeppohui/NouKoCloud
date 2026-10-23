@@ -100,6 +100,8 @@ class TestOptions(unittest.TestCase):
         self.assertTrue(info.has_video)
         audio_only = social.info_from_dict("u", {"title": "Подкаст", "formats": [{"vcodec": "none"}]})
         self.assertFalse(audio_only.has_video)
+        warned = social.info_from_dict("u", {"title": "Ролик"}, "No supported JavaScript runtime")
+        self.assertEqual(warned.warning, "No supported JavaScript runtime")
 
     def test_friendly_errors(self) -> None:
         cases = {
@@ -107,6 +109,7 @@ class TestOptions(unittest.TestCase):
             "ERROR: [youtube] x: Private video. Sign in": "приватное",
             "ERROR: Sign in to confirm you're not a bot": "войти в аккаунт",
             "ERROR: Video unavailable": "не найдено",
+            "WARNING: No supported JavaScript runtime": "JavaScript-движок",
             "что-то странное": "Подробности — в журнале",
         }
         for text, expected in cases.items():
@@ -168,6 +171,30 @@ class TestSocialPage(unittest.TestCase):
             row = next(iter(self.page._rows.values()))
             self.assertTrue(pump_until(lambda: bool(row.status.property("finished"))))
         self.assertEqual(row.status.text(), "Видео закрыто")
+
+    def test_js_runtime_warning_is_shown(self) -> None:
+        info = social.MediaInfo(url="u", title="Ролик", heights=[1080, 720],
+                                warning="No supported JavaScript runtime, some formats are missing")
+        with mock.patch.object(social, "probe", return_value=info):
+            self.page.link_edit.setText("u")
+            self.page.find()
+            self.assertTrue(pump_until(lambda: self.page.card.isVisibleTo(self.page)))
+        self.assertTrue(self.page.warning.isVisibleTo(self.page))
+        self.assertIn("JavaScript", self.page.warning.text())
+        self.assertIn("не скачаться", self.page.quality.itemText(1))
+        self.assertNotIn("не скачаться", self.page.quality.itemText(2))
+
+    def test_clip_toggle_scrolls_to_download_button(self) -> None:
+        info = social.MediaInfo(url="u", title="Ролик", heights=[720])
+        with mock.patch.object(social, "probe", return_value=info):
+            self.page.link_edit.setText("u")
+            self.page.find()
+            self.assertTrue(pump_until(lambda: self.page.card.isVisibleTo(self.page)))
+        scrolled = []
+        self.page._scroll.ensureWidgetVisible = lambda widget, *args: scrolled.append(widget)
+        self.page.clip.setChecked(True)
+        self.assertTrue(pump_until(lambda: bool(scrolled)))
+        self.assertIs(scrolled[-1], self.page.btn_download)
 
     def test_bad_link_shows_message(self) -> None:
         with mock.patch.object(social, "probe", side_effect=social.SocialError("нет такой ссылки")):

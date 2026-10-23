@@ -67,6 +67,7 @@ class MediaInfo:
     heights: list[int] = field(default_factory=list)   # доступные высоты видео
     has_video: bool = True
     raw: dict = field(default_factory=dict, repr=False)  # ответ yt-dlp (для предпросмотра)
+    warning: str = ""                                  # важное предупреждение yt-dlp
 
     @property
     def duration_text(self) -> str:
@@ -118,7 +119,11 @@ _ERRORS = (
     (r"timed out|Connection|Network|getaddrinfo|Temporary failure",
      "Нет связи с сайтом. Проверьте интернет и попробуйте ещё раз."),
     (r"Requested format is not available",
-     "Такого качества у этого видео нет — выберите другое."),
+     "Такого качества у этого видео нет — выберите другое. Если это YouTube, "
+     "без JavaScript-движка часть форматов может быть недоступна — попробуйте 720p."),
+    (r"JavaScript runtime|js runtime|No supported JavaScript",
+     "YouTube не отдал часть форматов: не установлен JavaScript-движок. "
+     "Выберите 720p или установите Deno/Node.js."),
 )
 
 
@@ -137,14 +142,14 @@ def friendly(exc: BaseException) -> str:
 # ----------------------------------------------------------------------
 # Сведения о видео
 # ----------------------------------------------------------------------
-def _base_options() -> dict:
+def _base_options(logger: "_YtLogger | None" = None) -> dict:
     return {
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
         "noplaylist": True,          # ссылка на видео в плейлисте — только это видео
         "windowsfilenames": True,
-        "logger": _YtLogger(),
+        "logger": logger or _YtLogger(),
         "socket_timeout": 20,
         "retries": 5,
         "fragment_retries": 10,
@@ -434,6 +439,9 @@ def _kill_processes(thread_id: int) -> None:
 class _YtLogger:
     """Сообщения yt-dlp — в наш журнал (а не в консоль, которой у .exe нет)."""
 
+    def __init__(self) -> None:
+        self.warnings: list[str] = []
+
     def debug(self, msg: str) -> None:
         if not msg.startswith("[debug] "):
             log.debug("yt-dlp: %s", msg)
@@ -442,6 +450,7 @@ class _YtLogger:
         log.debug("yt-dlp: %s", msg)
 
     def warning(self, msg: str) -> None:
+        self.warnings.append(msg)
         log.info("yt-dlp: %s", msg)
 
     def error(self, msg: str) -> None:
@@ -455,8 +464,9 @@ def probe(url: str) -> MediaInfo:
     url = url.strip()
     if not url:
         raise SocialError("Вставьте ссылку на видео.")
+    logger = _YtLogger()
     try:
-        with yt_dlp.YoutubeDL({**_base_options(), "skip_download": True}) as ydl:
+        with yt_dlp.YoutubeDL({**_base_options(logger), "skip_download": True}) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as exc:
         log.warning("Соцсети: не удалось прочитать ссылку %s: %s", url, exc, exc_info=True)
@@ -468,10 +478,12 @@ def probe(url: str) -> MediaInfo:
         if not entries:
             raise SocialError("По ссылке пустой список видео.")
         info = entries[0]
-    return info_from_dict(url, info)
+    warning = next((text for text in logger.warnings
+                    if "javascript runtime" in text.lower() or "js runtime" in text.lower()), "")
+    return info_from_dict(url, info, warning)
 
 
-def info_from_dict(url: str, info: dict) -> MediaInfo:
+def info_from_dict(url: str, info: dict, warning: str = "") -> MediaInfo:
     formats = info.get("formats") or []
     heights = sorted({int(f["height"]) for f in formats
                       if f.get("height") and f.get("vcodec") not in (None, "none")}, reverse=True)
@@ -488,6 +500,7 @@ def info_from_dict(url: str, info: dict) -> MediaInfo:
         heights=heights,
         has_video=has_video,
         raw=info,
+        warning=warning,
     )
 
 

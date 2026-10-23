@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 
 from .. import __version__
 from ..context import AppContext
-from ..core.errors import friendly_error
+from ..core.errors import AppError, friendly_error
 from ..core.models import CloudFile, ProviderId, SourceKind
 from ..core.update_check import fetch_latest_release, is_check_due, should_notify
 from ..downloader.engine import _safe_name
@@ -344,6 +344,10 @@ class MainWindow(FramelessWindow, QMainWindow):
         row.setSpacing(16)
         self._status_label = QLabel("Готово", bar)
         self._status_label.setMinimumWidth(100)
+        # Длинные ошибки (например, объяснение 404 от Яндекса) должны
+        # переноситься, а не обрезаться по правому краю.
+        self._status_label.setWordWrap(True)
+        self._status_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         row.addWidget(self._status_label, 1)
         self._activity_icon = IconLabel("target", "text", 12, bar, stroke=2.4)
         self._activity_icon.setVisible(False)
@@ -511,10 +515,16 @@ class MainWindow(FramelessWindow, QMainWindow):
             log.warning("Не удалось восстановить загрузки: %s", exc, exc_info=True)
             return
         if restored:
-            self._on_notice(
-                "info",
-                f"Найдено незаконченных загрузок: {len(restored)}. Продолжаем с места обрыва.",
-            )
+            cancelled = sum(1 for job in restored if job.state.name == "CANCELLED")
+            active = len(restored) - cancelled
+            if active:
+                text = f"Найдено незаконченных загрузок: {active}. Продолжаем с места обрыва."
+                if cancelled:
+                    text += f" Отменённых: {cancelled} — можно нажать «Продолжить»."
+            else:
+                text = (f"Найдено отменённых загрузок: {cancelled}. "
+                        "Их можно продолжить кнопкой «Продолжить».")
+            self._on_notice("info", text)
             self.show_workspace()
             self.tabs.setCurrentIndex(1)
 
@@ -525,6 +535,7 @@ class MainWindow(FramelessWindow, QMainWindow):
             log.error("Показано пользователю: %s", text)
             sound.play("error")
         self._status_label.setText(text)
+        self._status_label.setToolTip(text)
         if level == "error":
             self._status_label.setProperty("error", True)
         else:
@@ -647,6 +658,14 @@ class MainWindow(FramelessWindow, QMainWindow):
         dialog = AuthDialog(self.ctx.oauth, self.ctx.runtime, self)
         dialog.login_succeeded.connect(lambda pid, name: self._on_notice("info", f"Вход выполнен: {name}"))
         dialog.login_failed.connect(lambda pid, msg: self._on_notice("error", msg))
+
+        def open_settings() -> None:
+            # Ключей нет — закрываем «Аккаунты» и ведём в «Настройки»,
+            # а не оставляем пользователя с одной строчкой текста.
+            dialog.reject()
+            QTimer.singleShot(0, self._open_settings)
+
+        dialog.settings_requested.connect(open_settings)
         dialog.exec()
         self._restore_nav()
 
@@ -694,7 +713,12 @@ class MainWindow(FramelessWindow, QMainWindow):
         try:
             provider, ctx, items = future.result()
         except Exception as exc:
-            log.warning("Ссылка не открылась: %s", exc, exc_info=True)
+            # Плохая/закрытая ссылка — ожидаемая ситуация: полный стектрейс
+            # в журнале только мешает. Неожиданные ошибки пишем как раньше.
+            if isinstance(exc, AppError):
+                log.info("Ссылка не открылась: %s", exc)
+            else:
+                log.warning("Ссылка не открылась: %s", exc, exc_info=True)
             self._on_notice("error", friendly_error(exc))
             return
         title = ctx.display_name or provider.display_name
@@ -720,6 +744,7 @@ class MainWindow(FramelessWindow, QMainWindow):
         self.show_workspace()
         logged = [pid for pid in (ProviderId.YANDEX, ProviderId.GOOGLE) if self.ctx.oauth.is_logged_in(pid)]
         if not logged:
+            log.info("«Мой диск»: вход не выполнен — открываем «Аккаунты»")
             self._on_notice("warn", "Чтобы видеть «Мой диск», войдите в аккаунт.")
             self._open_accounts()
             logged = [pid for pid in (ProviderId.YANDEX, ProviderId.GOOGLE)
@@ -740,6 +765,7 @@ class MainWindow(FramelessWindow, QMainWindow):
         """
         if not self.ctx.oauth.is_logged_in(pid):
             if interactive:
+                log.info("«Мой диск» %s: вход не выполнен — открываем «Аккаунты»", pid.value)
                 self._on_notice("warn", "Сначала войдите в аккаунт (кнопка «Аккаунты»).")
                 self._open_accounts()
             if not self.ctx.oauth.is_logged_in(pid):
@@ -803,10 +829,11 @@ class MainWindow(FramelessWindow, QMainWindow):
 
         async def enqueue_all():
             jobs = []
+            skipped: list[CloudFile] = []
             for path, files in groups.items():
                 dest = root.joinpath(*(_safe_name(part) for part in path)) if path else root
-                jobs += await self.ctx.engine.enqueue(files, dest)
-            return jobs
+                jobs += await self.ctx.engine.enqueue(files, dest, skipped)
+            return jobs, skipped
 
         future = self.ctx.runtime.submit(enqueue_all())
         future.add_done_callback(self._in_gui(self._after_enqueue))
@@ -817,21 +844,47 @@ class MainWindow(FramelessWindow, QMainWindow):
 
     def _download_files(self, files: list[CloudFile]) -> None:
         dest = self.ctx.config.download_dir_path
-        future = self.ctx.runtime.submit(self.ctx.engine.enqueue(files, dest))
-        future.add_done_callback(self._in_gui(self._after_enqueue))
+        skipped: list[CloudFile] = []
+        future = self.ctx.runtime.submit(self.ctx.engine.enqueue(files, dest, skipped))
+        future.add_done_callback(self._in_gui(
+            lambda fut: self._after_enqueue(fut, skipped)))
 
-    def _after_enqueue(self, future) -> None:
+    def _after_enqueue(self, future, skipped: list[CloudFile] | None = None) -> None:
         try:
-            jobs = future.result()
+            result = future.result()
         except Exception as exc:
             log.warning("Не удалось поставить в очередь: %s", exc, exc_info=True)
-            self._on_notice("error", "Не удалось начать загрузку. Подробности в журнале.")
+            self._on_notice("error", "Не удалось начать загрузку. Подробности — в журнале.")
             return
+        if isinstance(result, tuple):
+            jobs, many_skipped = result
+            skipped = list(many_skipped or [])
+        else:
+            jobs = result
+        skipped = list(skipped or [])
         if jobs:
             sound.play("queue")
-        self.show_workspace()
-        self.tabs.setCurrentIndex(1)
-        self._on_notice("info", f"В очереди: {len(jobs)} файл(ов). Куда: {self.ctx.config.download_dir}")
+            self.show_workspace()
+            self.tabs.setCurrentIndex(1)
+        if skipped:
+            names = ", ".join(file.name for file in skipped[:3])
+            if len(skipped) > 3:
+                names += f" и ещё {len(skipped) - 3}"
+            log.info("Пропущено (уже скачано): %s", names)
+        if jobs and skipped:
+            self._on_notice(
+                "info",
+                f"В очереди: {len(jobs)}. Пропущено уже скачанных: "
+                f"{len(skipped)} ({names}). Куда: {self.ctx.config.download_dir}",
+            )
+        elif jobs:
+            self._on_notice(
+                "info", f"В очереди: {len(jobs)} файл(ов). Куда: {self.ctx.config.download_dir}")
+        elif skipped:
+            self._on_notice(
+                "info",
+                f"Уже скачано: {len(skipped)} файл(ов) — повторно не качаем. {names}",
+            )
     # ------------------------------------------------------------------
     def _on_file_selected(self, file: CloudFile) -> None:
         """Курсор встал на файл: показываем превью, если вкладка «Превью» открыта."""

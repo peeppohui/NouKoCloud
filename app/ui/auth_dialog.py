@@ -33,6 +33,7 @@ class AuthDialog(OverlayDialog):
 
     login_succeeded = Signal(str, str)   # provider id, имя аккаунта
     login_failed = Signal(str, str)      # provider id, сообщение
+    settings_requested = Signal()        # не настроены ключи — открыть «Настройки»
 
     def __init__(self, oauth, runtime, parent: QWidget | None = None) -> None:
         super().__init__("вход в аккаунты", parent, max_width=580)
@@ -153,6 +154,7 @@ class AuthDialog(OverlayDialog):
     def _login_yandex(self) -> None:
         if not self._oauth.configured(ProviderId.YANDEX):
             self._status.setText("Сначала укажите ключ приложения в настройках.")
+            self.settings_requested.emit()
             return
         self._yandex_code.setVisible(True)
         self._yandex_code.setFocus()
@@ -205,6 +207,7 @@ class AuthDialog(OverlayDialog):
     def _login_google(self) -> None:
         if not self._oauth.configured(ProviderId.GOOGLE):
             self._status.setText("Сначала укажите ключ приложения в настройках.")
+            self.settings_requested.emit()
             return
         self._status.setText("Открываем браузер…")
         self._google_btn.setEnabled(False)

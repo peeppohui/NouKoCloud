@@ -18,7 +18,7 @@ from ..net.http_client import HttpClient
 from ..net.metadata_cache import MetadataCache
 from ..net.speed import SpeedLimiter
 from ..providers.registry import ProviderRegistry
-from .state import find_states, load_state, save_state, state_dest
+from .state import find_states, load_state, save_state, state_dest, state_job_state
 from .transfer import Cancelled, Transfer, TransferContext, _discard_partial
 
 log = logging.getLogger(__name__)
@@ -87,6 +87,9 @@ class DownloadEngine:
         self._bus = bus
 
         self._queue: asyncio.Queue[str] = asyncio.Queue()
+        #: Что уже лежит в очереди. Нужно, чтобы «Продолжить» не поставило
+        #: одно и то же задание дважды.
+        self._queued: set[str] = set()
         self._jobs: dict[str, DownloadJob] = {}
         self._order: list[str] = []
         self._workers: list[asyncio.Task] = []
@@ -135,10 +138,20 @@ class DownloadEngine:
         self._workers.clear()
 
     # ------------------------------------------------------------------
-    async def enqueue(self, files: list[CloudFile], dest_dir: Path) -> list[DownloadJob]:
-        """Ставит файлы в очередь. Возвращает созданные задания."""
+    async def enqueue(self, files: list[CloudFile], dest_dir: Path,
+                      skipped: list[CloudFile] | None = None) -> list[DownloadJob]:
+        """Ставит файлы в очередь. Возвращает созданные задания.
+
+        skipped — необязательный список, куда складываются файлы, которые
+        уже скачаны в эту папку. Уже стоящие в очереди просто не дублируются.
+        """
         created: list[DownloadJob] = []
         for file in files:
+            if self._already_downloaded(file, dest_dir):
+                log.info("Уже скачан: %s — в очередь не ставим", file.name)
+                if skipped is not None:
+                    skipped.append(file)
+                continue
             if any(_same_file(job.file, file) and job.dest_dir == dest_dir
                    and job.state in (JobState.QUEUED, JobState.RUNNING, JobState.PAUSED)
                    for job in self._jobs.values()):
@@ -152,6 +165,7 @@ class DownloadEngine:
             self._order.append(job.job_id)
             created.append(job)
             self._queue.put_nowait(job.job_id)
+            self._queued.add(job.job_id)
         log.info("В очередь добавлено файлов: %d", len(created))
         self._emit_snapshot()
         await self.start()
@@ -187,6 +201,24 @@ class DownloadEngine:
             return candidate
         return name
 
+    @staticmethod
+    def _already_downloaded(file: CloudFile, dest_dir: Path) -> bool:
+        """Файл того же размера уже лежит в папке — второй раз не качаем."""
+        if not file.size:
+            return False
+        stem, suffix = os.path.splitext(_safe_name(file.name))
+        for attempt in range(1000):
+            name = _safe_name(file.name) if attempt == 0 else f"{stem} ({attempt}){suffix}"
+            final = dest_dir / name
+            try:
+                if not final.exists():
+                    return False
+                if final.stat().st_size == file.size:
+                    return True
+            except OSError:
+                return False
+        return False
+
     async def recover(self, dest_dir: Path) -> list[DownloadJob]:
         """Поднимает незаконченные загрузки после перезапуска программы."""
         restored: list[DownloadJob] = []
@@ -201,14 +233,29 @@ class DownloadEngine:
             job.segments = segments
             job.downloaded_bytes = sum(seg.received for seg in segments)
             job.pause_event.set()
+            cancelled = state_job_state(state_path) == JobState.CANCELLED.value
+            if cancelled:
+                # Пользователь отменил загрузку вручную — не запускаем её
+                # сама, но показываем в очереди: он может нажать «Продолжить».
+                job.state = JobState.CANCELLED
             self._jobs[job.job_id] = job
             self._order.append(job.job_id)
-            self._queue.put_nowait(job.job_id)
+            if not cancelled:
+                self._queue.put_nowait(job.job_id)
+                self._queued.add(job.job_id)
             restored.append(job)
         if restored:
-            log.info("Восстановлено незаконченных загрузок: %d", len(restored))
+            active = sum(1 for job in restored if job.state is not JobState.CANCELLED)
+            log.info("Восстановлено незаконченных загрузок: %d (отменённых: %d)",
+                     active, len(restored) - active)
             self._emit_snapshot()
             await self.start()
+            if active:
+                # Задания уже лежат в очереди, но рабочих нет: без этого они
+                # навсегда остаются «В очереди» и не качаются.
+                self._spawn_workers(self._config.max_parallel_files)
+                log.info("Движок загрузок запущен (файлов одновременно: %d)",
+                         self._config.max_parallel_files)
         return restored
 
     # ------------------------------------------------------------------
@@ -223,11 +270,42 @@ class DownloadEngine:
             self._emit_snapshot()
 
     async def resume(self, job_id: str) -> None:
+        """Продолжает паузу, повторяет ошибку или возвращает отменённую загрузку."""
         job = self._jobs.get(job_id)
-        if job and job.state is JobState.PAUSED:
-            job.pause_event.set()
-            job.state = JobState.RUNNING if job_id in self._running else JobState.QUEUED
-            self._emit_snapshot()
+        if not job or job.state not in (JobState.PAUSED, JobState.FAILED, JobState.CANCELLED):
+            return
+        job.cancel_event.clear()
+        job.pause_event.set()
+        job.error = None
+        job.finished_at = None
+        if job_id in self._running:
+            if job.state is JobState.PAUSED:
+                job.state = JobState.RUNNING
+            else:
+                # Старая задача ещё останавливается после отмены/ошибки.
+                # Дождёмся её и только потом поставим задание заново.
+                asyncio.create_task(self._resume_after_stop(job_id))
+                return
+        else:
+            job.state = JobState.QUEUED
+            if job_id not in self._queued:
+                self._queue.put_nowait(job_id)
+                self._queued.add(job_id)
+            self._spawn_workers(self._config.max_parallel_files)
+        if job.segments or job.part_path.exists():
+            # Снимаем пометку «отменено»: после перезапуска задание должно
+            # снова подхватиться, а не ждать нажатия.
+            save_state(job)
+        self._emit_snapshot()
+
+    async def _resume_after_stop(self, job_id: str) -> None:
+        while job_id in self._running and not self._closing:
+            await asyncio.sleep(0.05)
+        if self._closing:
+            return
+        job = self._jobs.get(job_id)
+        if job is not None and job.state in (JobState.FAILED, JobState.CANCELLED):
+            await self.resume(job_id)
 
     async def cancel(self, job_id: str) -> None:
         job = self._jobs.get(job_id)
@@ -238,10 +316,13 @@ class DownloadEngine:
         if job.state in (JobState.QUEUED, JobState.PAUSED, JobState.RUNNING):
             job.state = JobState.CANCELLED
             job.finished_at = time.time()
+            if job.segments or job.part_path.exists():
+                save_state(job)
         self._interrupt(job_id)
         if job_id not in self._running:
             # Работающее задание уберёт за собой само (см. _run_job).
-            self._drop_unfinished(job)
+            # keep=True — «Хранить недокачанные файлы» действует и при отмене.
+            self._drop_unfinished(job, keep=True)
         self._emit_snapshot()
 
     async def remove(self, job_id: str) -> None:
@@ -280,6 +361,7 @@ class DownloadEngine:
             except asyncio.CancelledError:
                 await self._file_limit.release()
                 return
+            self._queued.discard(job_id)
             try:
                 job = self._jobs.get(job_id)
                 if job is not None and job.state is not JobState.CANCELLED:
@@ -322,15 +404,16 @@ class DownloadEngine:
             job.finished_at = job.finished_at or time.time()
             log.info("Отменено: %s", job.file.name)
             if not self._closing:
-                self._drop_unfinished(job)
+                self._drop_unfinished(job, keep=True)
         except Cancelled:
             job.state = JobState.CANCELLED
             job.finished_at = time.time()
             log.info("Отменено: %s", job.file.name)
             # При закрытии программы задания тоже «отменяются», но их надо
-            # продолжить после перезапуска. Отмену пользователем — нет.
+            # продолжить после перезапуска. Отменённое пользователем храним,
+            # если включена настройка «Хранить недокачанные файлы».
             if not self._closing:
-                self._drop_unfinished(job)
+                self._drop_unfinished(job, keep=True)
         except Exception as exc:
             job.state = JobState.FAILED
             job.error = friendly_error(exc, provider=job.file.provider.value)

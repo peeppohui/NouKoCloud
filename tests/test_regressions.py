@@ -412,9 +412,9 @@ class TestLinks(unittest.TestCase):
 
 
 class TestCancel(unittest.IsolatedAsyncioTestCase):
-    """Отменённая пользователем загрузка не должна воскресать после перезапуска."""
+    """Отменённая загрузка не стартует сама, но её можно продолжить вручную."""
 
-    async def test_cancelled_job_is_not_recovered(self) -> None:
+    async def test_cancelled_job_is_restored_as_cancelled_not_started(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp)
             config = AppConfig()
@@ -423,20 +423,23 @@ class TestCancel(unittest.IsolatedAsyncioTestCase):
             file = CloudFile(provider=ProviderId.YANDEX, file_id="1", path="/a.mp4", name="a.mp4",
                              kind=EntryKind.FILE, size=100, source=SourceKind.PUBLIC)
             job = DownloadJob(file=file, dest_dir=dest)
+            job.state = JobState.CANCELLED
             job.parts_dir.mkdir(parents=True, exist_ok=True)
             job.part_path.write_bytes(b"\0" * 100)
             save_state(job)
 
             restored = await engine.recover(dest)
             self.assertEqual(len(restored), 1)
-            await engine.pause(restored[0].job_id)
-            await engine.cancel(restored[0].job_id)
+            self.assertIs(restored[0].state, JobState.CANCELLED)
+            self.assertEqual(engine._workers, [], "отменённую загрузку не запускаем сами")
+            self.assertTrue(job.part_path.exists())
+            self.assertTrue(job.state_path.exists())
             await engine.stop()
 
-            self.assertFalse(job.part_path.exists())
-            self.assertFalse(job.state_path.exists())
             engine2 = DownloadEngine(config, None, None, None, mock.Mock())  # type: ignore[arg-type]
-            self.assertEqual(await engine2.recover(dest), [])
+            restored2 = await engine2.recover(dest)
+            self.assertEqual(len(restored2), 1)
+            self.assertIs(restored2[0].state, JobState.CANCELLED)
             await engine2.stop()
 
 
@@ -487,8 +490,8 @@ class TestKeepPartialFiles(unittest.IsolatedAsyncioTestCase):
             await engine.remove(job.job_id)
             self.assertTrue(job.part_path.exists(), "недокачанный файл должен остаться")
 
-    async def test_cancelled_job_always_removes_partial(self) -> None:
-        """Отмена пользователем — это отмена: файл убираем независимо от настройки."""
+    async def test_cancelled_job_keeps_partial_when_asked(self) -> None:
+        """Отмена с «хранить недокачанные» оставляет кусок — его можно продолжить."""
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp)
             config = AppConfig()
@@ -505,8 +508,120 @@ class TestKeepPartialFiles(unittest.IsolatedAsyncioTestCase):
             engine._order.append(job.job_id)
 
             await engine.cancel(job.job_id)
+            self.assertTrue(job.part_path.exists())
+            self.assertTrue(job.state_path.exists())
+            self.assertIs(job.state, JobState.CANCELLED)
+            await engine.stop()
+
+    async def test_cancelled_job_removes_partial_when_keep_off(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp)
+            config = AppConfig()
+            config.download_dir = tmp
+            config.keep_partial_files = False
+            engine = DownloadEngine(config, None, None, None, mock.Mock())  # type: ignore[arg-type]
+            file = CloudFile(provider=ProviderId.YANDEX, file_id="1", path="/a.mp4", name="a.mp4",
+                             kind=EntryKind.FILE, size=100, source=SourceKind.PUBLIC)
+            job = DownloadJob(file=file, dest_dir=dest)
+            job.parts_dir.mkdir(parents=True, exist_ok=True)
+            job.part_path.write_bytes(b"\0" * 100)
+            save_state(job)
+            engine._jobs[job.job_id] = job
+            engine._order.append(job.job_id)
+
+            await engine.cancel(job.job_id)
             self.assertFalse(job.part_path.exists())
             self.assertFalse(job.state_path.exists())
+            await engine.stop()
+
+
+class TestResumeAndSkip(unittest.IsolatedAsyncioTestCase):
+    """«Продолжить» работает для FAILED и CANCELLED; готовый файл не качаем заново."""
+
+    async def test_failed_and_cancelled_jobs_can_be_resumed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig()
+            config.download_dir = tmp
+            engine = DownloadEngine(config, None, None, None, mock.Mock())  # type: ignore[arg-type]
+            started: list[str] = []
+
+            async def fake_run(job) -> None:
+                started.append(job.job_id)
+                job.state = JobState.DONE
+
+            engine._run_job = fake_run  # type: ignore[assignment]
+            file = CloudFile(provider=ProviderId.YANDEX, file_id="1", path="/a.mp4", name="a.mp4",
+                             kind=EntryKind.FILE, size=100, source=SourceKind.PUBLIC)
+
+            failed = DownloadJob(file=file, dest_dir=Path(tmp))
+            failed.state = JobState.FAILED
+            engine._jobs[failed.job_id] = failed
+            engine._order.append(failed.job_id)
+            await engine.resume(failed.job_id)
+            for _ in range(200):
+                if failed.state is JobState.DONE:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertIs(failed.state, JobState.DONE)
+            self.assertIn(failed.job_id, started)
+
+            cancelled = DownloadJob(file=file, dest_dir=Path(tmp))
+            engine._jobs[cancelled.job_id] = cancelled
+            engine._order.append(cancelled.job_id)
+            await engine.cancel(cancelled.job_id)
+            self.assertIs(cancelled.state, JobState.CANCELLED)
+            await engine.resume(cancelled.job_id)
+            for _ in range(200):
+                if cancelled.state is JobState.DONE:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertIs(cancelled.state, JobState.DONE)
+            self.assertIn(cancelled.job_id, started)
+            await engine.stop()
+
+    async def test_recover_starts_workers_for_active_job(self) -> None:
+        """После рестарта незавершённая загрузка должна поехать сама (баг 0.5.5)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp)
+            config = AppConfig()
+            config.download_dir = tmp
+            file = CloudFile(provider=ProviderId.YANDEX, file_id="1", path="/a.mp4", name="a.mp4",
+                             kind=EntryKind.FILE, size=100, source=SourceKind.PUBLIC)
+            job = DownloadJob(file=file, dest_dir=dest)
+            job.state = JobState.QUEUED
+            save_state(job)
+            engine = DownloadEngine(config, None, None, None, mock.Mock())  # type: ignore[arg-type]
+            started: list[str] = []
+
+            async def fake_run(j) -> None:
+                started.append(j.job_id)
+                j.state = JobState.DONE
+
+            engine._run_job = fake_run  # type: ignore[assignment]
+            restored = await engine.recover(dest)
+            self.assertEqual(len(restored), 1)
+            for _ in range(200):
+                if restored[0].state is JobState.DONE:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertIs(restored[0].state, JobState.DONE)
+            self.assertEqual(started, [restored[0].job_id])
+            await engine.stop()
+
+    async def test_already_downloaded_file_is_not_queued_again(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp)
+            (dest / "a.mp4").write_bytes(b"\0" * 100)
+            config = AppConfig()
+            config.download_dir = tmp
+            engine = DownloadEngine(config, None, None, None, mock.Mock())  # type: ignore[arg-type]
+            file = CloudFile(provider=ProviderId.YANDEX, file_id="1", path="/a.mp4", name="a.mp4",
+                             kind=EntryKind.FILE, size=100, source=SourceKind.PUBLIC)
+
+            skipped: list[CloudFile] = []
+            jobs = await engine.enqueue([file], dest, skipped)
+            self.assertEqual(jobs, [])
+            self.assertEqual(skipped, [file])
             await engine.stop()
 
 

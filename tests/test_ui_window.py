@@ -105,6 +105,30 @@ class TestMainWindow(unittest.TestCase):
         jobs = self.ctx.engine.snapshot()
         self.assertEqual(len(jobs), 141, "в очередь должно встать 141 файл")
 
+    def test_already_downloaded_file_is_reported_not_queued(self) -> None:
+        """Готовый файл того же размера не встаёт в очередь второй раз."""
+        import time
+
+        dest = Path(self.ctx.config.download_dir)
+        (dest / "a.mp4").write_bytes(b"\0" * 1024)
+        tree = self.win.tree
+        ctx = BrowseContext(source=SourceKind.PUBLIC, public_key="https://disk.yandex.ru/d/X")
+        root = tree.add_root("корень", ctx)
+        tree.set_children(root, [make_file("a.mp4", 1024)])
+        tree._set_all_checked(True)
+
+        with patch.object(self.win, "_on_notice") as notice:
+            self.win._download_selected()
+            deadline = time.time() + 5
+            while not notice.called and time.time() < deadline:
+                QApplication.processEvents()
+                time.sleep(0.01)
+        self.assertTrue(notice.called, "окно должно сказать, что файл уже есть")
+        self.assertEqual(self.ctx.engine.snapshot(), [])
+        message = notice.call_args[0][1]
+        self.assertIn("Уже", message)
+        self.assertIn("a.mp4", message)
+
     def test_hovered_folder_is_loaded_once(self) -> None:
         """Мышь задержалась над папкой — список берётся заранее, раскрытие его не повторяет."""
         import concurrent.futures
@@ -141,6 +165,15 @@ class TestMainWindow(unittest.TestCase):
         self.win._open_my_drive_for(ProviderId.GOOGLE, interactive=False)
         drive = self.win.tree.drive(ProviderId.GOOGLE)
         self.assertIn("войдите", drive.child(0).text())
+
+    def test_click_on_my_drive_without_login_opens_accounts(self) -> None:
+        """Клик по «Мой диск» без входа должен сразу вести в аккаунты."""
+        self.win.ctx.oauth.is_logged_in = lambda pid: False
+        drive = self.win.tree.drive(ProviderId.GOOGLE)
+        with patch.object(self.win, "_open_accounts") as accounts:
+            self.win.tree._on_clicked(drive.index())
+            QApplication.processEvents()
+        accounts.assert_called_once()
 
     def test_link_opened_next_to_my_drive(self) -> None:
         """После открытия ссылки «Мой диск» остаётся в разделе."""

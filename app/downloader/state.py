@@ -64,6 +64,10 @@ def save_state(job: DownloadJob) -> None:
         "dest": str(job.dest_dir),
         "total": job.total_bytes,
         "segments": [asdict(seg) for seg in job.segments],
+        # Состояние на момент сохранения. По нему recover() отличает
+        # загрузку, прерванную закрытием программы, от отменённой вручную:
+        # отменённую не надо запускать автоматически.
+        "job_state": job.state.value,
         "updated_at": time.time(),
     }
     path = job.state_path
@@ -112,6 +116,18 @@ def state_dest(path: Path) -> Path | None:
         return None
     dest = payload.get("dest")
     return Path(dest) if dest else None
+
+
+def state_job_state(path: Path) -> str | None:
+    """Состояние задания, записанное вместе с сегментами."""
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    value = payload.get("job_state")
+    return str(value) if value else None
 
 
 def clear_state(path: Path) -> None:

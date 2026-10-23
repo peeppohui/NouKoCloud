@@ -257,6 +257,9 @@ class FileTree(QWidget):
         self._view.expanded.connect(self._on_expanded)
         # activated — двойной клик и Enter (на Windows).
         self._view.activated.connect(self._on_double_clicked)
+        # Обычный клик по «Моему диску» тоже должен загружать его: иначе
+        # без входа не происходит ничего и непонятно, что нажимать.
+        self._view.clicked.connect(self._on_clicked)
         self._view.selectionModel().currentChanged.connect(self._on_current_changed)
         # Мышь над файлом — сигнал для предзагрузки превью (без клика).
         self._view.setMouseTracking(True)
@@ -655,6 +658,17 @@ class FileTree(QWidget):
         self.set_children(parent, files)
 
     # ------------------------------------------------------------------
+    def _on_clicked(self, index) -> None:
+        """Клик по «Моему диску» (или подсказке внутри) запускает загрузку."""
+        item = self._model.itemFromIndex(index.siblingAtColumn(0)) if index.isValid() else None
+        if item is None:
+            return
+        if item.data(HINT_ROLE):
+            item = item.parent()
+        if item is None or not item.data(DRIVE_ROLE) or item.data(LOADED_ROLE):
+            return
+        self._request_drive(ProviderId(item.data(DRIVE_ROLE)))
+
     def _on_double_clicked(self, index) -> None:
         item = self._model.itemFromIndex(index)
         if item is None:
