@@ -436,7 +436,7 @@ class SocialPage(StarsBackground):
             # Сцена 16:9 по ширине карточки, но не выше половины окна.
             width = self.card.width() - 36
             stage = max(170, min(int(width * 9 / 16), int(self.height() * 0.36)))
-            self.player.setFixedHeight(stage + 96)       # + панель управления и строка статуса
+            self.player.set_embedded_height(stage + 96)  # + панель управления и строка статуса
         return super().eventFilter(obj, event)
 
     # ------------------------------------------------------------------
@@ -567,8 +567,9 @@ class SocialPage(StarsBackground):
             return None
         focus = QApplication.focusWidget()
         if focus is not None:
-            if focus.window() is not self.window():
-                return None                  # открыт диалог (настройки и т. п.)
+            in_player = focus is self.player or self.player.isAncestorOf(focus)
+            if focus.window() is not self.window() and not in_player:
+                return None                  # открыт диалог (настройки и т. п.); во весь экран — можно
             if isinstance(focus, QLineEdit) and focus not in (self.clip_start, self.clip_end):
                 return None                  # печатают ссылку — буквы нужны там
         return action
