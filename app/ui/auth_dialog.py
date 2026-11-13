@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import Qt, QUrl, Signal
+from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -34,11 +35,16 @@ class AuthDialog(OverlayDialog):
     login_succeeded = Signal(str, str)   # provider id, имя аккаунта
     login_failed = Signal(str, str)      # provider id, сообщение
     settings_requested = Signal()        # не настроены ключи — открыть «Настройки»
+    logout_requested = Signal(str)       # provider id — выход подтверждён
 
-    def __init__(self, oauth, runtime, parent: QWidget | None = None) -> None:
+    def __init__(self, oauth, runtime, parent: QWidget | None = None, engine=None) -> None:
         super().__init__("вход в аккаунты", parent, max_width=580)
         self._oauth = oauth
         self._runtime = runtime
+        self._engine = engine
+        # После выхода «Сменить аккаунт» сразу открывает вход заново.
+        self._switch_after_logout: set[ProviderId] = set()
+        self._logout_buttons: dict[ProviderId, tuple[QPushButton, QPushButton]] = {}
         self.setWindowTitle("Вход в облачные аккаунты")
         body = self.body_layout
         body.setSpacing(18)
@@ -74,6 +80,20 @@ class AuthDialog(OverlayDialog):
         yandex_row.addWidget(self._yandex_btn)
         yandex_row.addStretch(1)
         yandex_lay.addLayout(yandex_row)
+
+        yandex_actions = QHBoxLayout()
+        yandex_actions.setSpacing(10)
+        yandex_logout = button("Выйти", "outline", yandex_card)
+        yandex_logout.clicked.connect(
+            lambda: self._request_logout(ProviderId.YANDEX, switch=False))
+        yandex_switch = button("Сменить аккаунт", "link", yandex_card)
+        yandex_switch.clicked.connect(
+            lambda: self._request_logout(ProviderId.YANDEX, switch=True))
+        yandex_actions.addWidget(yandex_logout)
+        yandex_actions.addWidget(yandex_switch)
+        yandex_actions.addStretch(1)
+        yandex_lay.addLayout(yandex_actions)
+        self._logout_buttons[ProviderId.YANDEX] = (yandex_logout, yandex_switch)
         body.addWidget(yandex_card)
 
         # --- Google ---
@@ -85,6 +105,20 @@ class AuthDialog(OverlayDialog):
         google_row.addWidget(self._google_btn)
         google_row.addStretch(1)
         google_lay.addLayout(google_row)
+
+        google_actions = QHBoxLayout()
+        google_actions.setSpacing(10)
+        google_logout = button("Выйти", "outline", google_card)
+        google_logout.clicked.connect(
+            lambda: self._request_logout(ProviderId.GOOGLE, switch=False))
+        google_switch = button("Сменить аккаунт", "link", google_card)
+        google_switch.clicked.connect(
+            lambda: self._request_logout(ProviderId.GOOGLE, switch=True))
+        google_actions.addWidget(google_logout)
+        google_actions.addWidget(google_switch)
+        google_actions.addStretch(1)
+        google_lay.addLayout(google_actions)
+        self._logout_buttons[ProviderId.GOOGLE] = (google_logout, google_switch)
         body.addWidget(google_card)
 
         self._status = QLabel("", self.body)
@@ -136,10 +170,38 @@ class AuthDialog(OverlayDialog):
 
         HelpDialog(self.parentWidget() or self).exec()
 
+    def refresh(self) -> None:
+        """Публичное обновление после входа/выхода (для MainWindow)."""
+        self._refresh()
+
+    def set_status(self, text: str) -> None:
+        self._status.setText(text)
+
+    def logout_finished(self, pid: ProviderId) -> None:
+        """Вызывается MainWindow после успешного выхода."""
+        self._set_logout_busy(pid, False)
+        self._refresh()
+        self._status.setText("Вы вышли из аккаунта. Публичные ссылки остались.")
+        if pid in self._switch_after_logout:
+            self._switch_after_logout.discard(pid)
+            # Не открываем браузер прямо из обработчика сигнала: даём
+            # диалогу перерисоваться и только потом начинаем новый вход.
+            QTimer.singleShot(0, lambda: self._login(pid))
+
+    def logout_failed(self, pid: ProviderId, message: str) -> None:
+        self._set_logout_busy(pid, False)
+        self._switch_after_logout.discard(pid)
+        self._status.setText(message)
+
+    def _set_logout_busy(self, pid: ProviderId, busy: bool) -> None:
+        for widget in self._logout_buttons.get(pid, ()):
+            widget.setEnabled(not busy)
+
     def _refresh(self) -> None:
         for chip, pid in ((self._yandex_status, ProviderId.YANDEX), (self._google_status, ProviderId.GOOGLE)):
             name = self._oauth.account_name(pid)
-            if self._oauth.is_logged_in(pid):
+            logged = self._oauth.is_logged_in(pid)
+            if logged:
                 chip.setText(f"✓  вы вошли как {name or 'аккаунт'}")
                 set_prop(chip, "chip", "ok")
             elif not self._oauth.configured(pid):
@@ -149,6 +211,72 @@ class AuthDialog(OverlayDialog):
             else:
                 chip.setText("не выполнен вход")
                 set_prop(chip, "chip", "muted")
+            for widget in self._logout_buttons.get(pid, ()):
+                widget.setVisible(logged)
+            login_btn = self._yandex_btn if pid is ProviderId.YANDEX else self._google_btn
+            login_btn.setVisible(not logged)
+            if logged:
+                if pid is ProviderId.YANDEX:
+                    self._yandex_code.setVisible(False)
+                    self._yandex_link.setVisible(False)
+
+    def _login(self, pid: ProviderId) -> None:
+        if pid is ProviderId.YANDEX:
+            self._login_yandex()
+        else:
+            self._login_google()
+
+    def _active_jobs(self, pid: ProviderId) -> int:
+        if self._engine is None:
+            return 0
+        try:
+            jobs = self._engine.snapshot()
+        except Exception:
+            return 0
+        return sum(
+            1 for job in jobs
+            if job.file.provider is pid
+            and job.state.name in ("QUEUED", "RUNNING", "PAUSED")
+        )
+
+    def _confirm_logout(self, pid: ProviderId) -> bool:
+        active = self._active_jobs(pid)
+        box = QMessageBox(self)
+        box.setWindowTitle("Выход из аккаунта")
+        box.setIcon(QMessageBox.Icon.Warning if active else QMessageBox.Icon.Question)
+        if active:
+            box.setText(
+                f"Есть незавершённые загрузки: {active}. Они встанут на паузу.\n"
+                "Продолжить их можно после повторного входа."
+            )
+            confirm_text = "Остановить задания и выйти"
+        else:
+            box.setText(
+                "Выйти из аккаунта?\n"
+                "Токен будет удалён с этого компьютера. Публичные ссылки останутся."
+            )
+            confirm_text = "Выйти"
+        confirm = box.addButton(confirm_text, QMessageBox.ButtonRole.DestructiveRole)
+        cancel = box.addButton("Не выходить", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel)
+        box.exec()
+        return box.clickedButton() is confirm
+
+    def _request_logout(self, pid: ProviderId, switch: bool) -> None:
+        if not self._oauth.is_logged_in(pid):
+            return
+        if not self._confirm_logout(pid):
+            return
+        if switch:
+            self._switch_after_logout.add(pid)
+        else:
+            self._switch_after_logout.discard(pid)
+        self._set_logout_busy(pid, True)
+        self._status.setText(
+            "Останавливаем задания и выходим…" if self._active_jobs(pid)
+            else "Выходим из аккаунта…"
+        )
+        self.logout_requested.emit(pid.value)
 
     # ------------------------------------------------------------------
     def _login_yandex(self) -> None:

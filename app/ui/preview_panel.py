@@ -64,7 +64,9 @@ class PreviewPanel(QWidget):
         layout.addLayout(info)
 
         self._hint = QLabel(
-            "Пробел — пауза, ← / → — перемотка на 5 секунд. Файл целиком не скачивается.", self)
+            "Пробел — пауза, ← / → — перемотка на 5 секунд, , и . — покадрово, "
+            "J / K / L — назад на кадр, пауза и скорость, I / O — отметки фрагмента. "
+            "Файл целиком не скачивается.", self)
         self._hint.setProperty("role", "hint")
         self._hint.setWordWrap(True)
         layout.addWidget(self._hint)

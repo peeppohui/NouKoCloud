@@ -176,11 +176,18 @@ class TestSingleInstance(unittest.TestCase):
     """Повторный запуск передаёт команду уже работающей копии (оба — отдельные процессы)."""
 
     def test_second_launch_reaches_first(self) -> None:
+        root = str(Path(__file__).resolve().parent.parent)
+        # Свой APPDATA: иначе тест цепляется к каналу реально запущенной
+        # программы и её же команду «open …» получает вместо тестового сервера.
+        with tempfile.TemporaryDirectory() as appdata:
+            env = {**os.environ, "QT_QPA_PLATFORM": "offscreen",
+                   "APPDATA": appdata, "XDG_CONFIG_HOME": appdata}
+            self._run_single_instance(root, env)
+
+    def _run_single_instance(self, root: str, env: dict[str, str]) -> None:
         import subprocess
         import sys
 
-        root = str(Path(__file__).resolve().parent.parent)
-        env = {**os.environ, "QT_QPA_PLATFORM": "offscreen"}
         server = subprocess.Popen([sys.executable, "-c", _SERVER, root], stdout=subprocess.PIPE,
                                   text=True, encoding="utf-8", env=env)
         try:

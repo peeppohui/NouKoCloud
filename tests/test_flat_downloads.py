@@ -41,7 +41,8 @@ class TestFlatEnqueue(unittest.IsolatedAsyncioTestCase):
     async def test_same_names_from_different_folders_do_not_clash(self) -> None:
         jobs = await self.engine.enqueue([clip("C0001.MP4", "Камера A", "a"),
                                           clip("C0001.MP4", "Камера B", "b")], self.root)
-        self.assertEqual([j.file.name for j in jobs], ["C0001.MP4", "C0001 (2).MP4"])
+        # Единая нумерация с Transfer._pick_target_name: «(1)», а не «(2)».
+        self.assertEqual([j.file.name for j in jobs], ["C0001.MP4", "C0001 (1).MP4"])
 
     async def test_same_file_twice_is_queued_once(self) -> None:
         first = await self.engine.enqueue([clip("C0001.MP4", "Камера A", "a")], self.root)
@@ -52,7 +53,7 @@ class TestFlatEnqueue(unittest.IsolatedAsyncioTestCase):
     async def test_foreign_file_with_same_name_is_kept(self) -> None:
         (self.root / "C0001.MP4").write_bytes(b"x" * 7)     # чужой файл другого размера
         jobs = await self.engine.enqueue([clip("C0001.MP4", "Камера A", "a")], self.root)
-        self.assertEqual(jobs[0].file.name, "C0001 (2).MP4")
+        self.assertEqual(jobs[0].file.name, "C0001 (1).MP4")
 
 
 class TestNoPartFilesInDownloads(unittest.IsolatedAsyncioTestCase):

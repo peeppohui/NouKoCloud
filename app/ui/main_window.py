@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import subprocess
@@ -13,9 +14,11 @@ from PySide6.QtCore import QByteArray, QEvent, QObject, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QSplitter,
     QStackedWidget,
@@ -25,16 +28,21 @@ from PySide6.QtWidgets import (
 
 from .. import __version__
 from ..context import AppContext
-from ..core.errors import AppError, friendly_error
+from ..core.diagnostics import create_diagnostics
+from ..core.diskspace import check_space, format_bytes
+from ..core.errors import AppError, friendly_error, message_needs_login, needs_login
 from ..core.models import CloudFile, ProviderId, SourceKind
 from ..core.update_check import fetch_latest_release, is_check_due, should_notify
 from ..downloader.engine import _safe_name
+from ..downloader.report import default_report_path, write_report
 from ..core.logging_setup import errors_log_path
 from ..core.paths import logs_dir
 from ..providers.base import BrowseContext
+from ..preview.player import format_timecode
 from ..preview.stream_cache import cache_usage, clear_directory
 from .auth_dialog import AuthDialog
 from .file_tree import LOADED_ROLE, FileTree
+from .help_dialog import HelpDialog
 from .preview_panel import PreviewPanel
 from .queue_view import QueueView
 from . import theme
@@ -166,6 +174,7 @@ class MainWindow(FramelessWindow, QMainWindow):
         self._connect_bus()
         self._quitting = False
         self._update_check_running = False
+        self._update_check_manual = False
         self.tray: Tray | None = None
         self._setup_background()
         self._on_checked_changed(0)
@@ -239,7 +248,7 @@ class MainWindow(FramelessWindow, QMainWindow):
         self.tree.file_selected.connect(self._on_file_selected)
         self.tree.file_hovered.connect(self._on_file_hovered)
         self.tree.folder_hovered.connect(self._on_folder_hovered)
-        self.tree.open_drive_requested.connect(self._open_my_drive_for)
+        self.tree.open_drive_requested.connect(self._refresh_my_drive)
         self.tree.checked_changed.connect(self._on_checked_changed)
         left_layout.addWidget(self.tree, 1)
 
@@ -279,6 +288,7 @@ class MainWindow(FramelessWindow, QMainWindow):
         self._make_glass(self.preview_panel)
         self.preview_panel.download_requested.connect(self._download_one)
         self.preview_panel.player.failed.connect(self._on_preview_failed)
+        self.preview_panel.player.frame_save_requested.connect(self._on_save_frame)
         self.tabs.addWidget(self.preview_panel)
         self.queue_view = QueueView(self.tabs)
         self._make_glass(self.queue_view)
@@ -286,7 +296,10 @@ class MainWindow(FramelessWindow, QMainWindow):
         self.queue_view.resume_requested.connect(self._engine_call(self.ctx.engine.resume))
         self.queue_view.cancel_requested.connect(self._engine_call(self.ctx.engine.cancel))
         self.queue_view.remove_requested.connect(self._engine_call(self.ctx.engine.remove))
+        self.queue_view.retry_failed_requested.connect(
+            self._engine_call(self.ctx.engine.retry_failed))
         self.queue_view.open_folder_requested.connect(self._open_download_dir)
+        self.queue_view.csv_requested.connect(self._export_csv)
         self.tabs.addWidget(self.queue_view)
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.tabs.currentChanged.connect(self._seg.set_current)
@@ -359,6 +372,14 @@ class MainWindow(FramelessWindow, QMainWindow):
                            "noukocloud.log — всё, что делала программа")
         log_btn.clicked.connect(self._open_logs)
         row.addWidget(log_btn)
+        help_btn = button("Помощь", "ghost", bar, icon_name="info", size="s")
+        help_btn.setToolTip("Инструкция, диагностика и сведения о программе")
+        help_btn.clicked.connect(self._open_help)
+        row.addWidget(help_btn)
+        about_btn = button("О программе", "ghost", bar, icon_name="gear", size="s")
+        about_btn.setToolTip("Версия, дата сборки, ссылка на релиз и лицензии")
+        about_btn.clicked.connect(self._open_about)
+        row.addWidget(about_btn)
         layout.addWidget(bar)
 
     # --- экраны -----------------------------------------------------------
@@ -444,6 +465,7 @@ class MainWindow(FramelessWindow, QMainWindow):
         bus.job_progress.connect(self._on_progress)
         bus.job_finished.connect(self._on_finished)
         bus.logged_in.connect(self._on_logged_in)
+        bus.logged_out.connect(self._on_logged_out)
         bus.listing_started.connect(lambda pid: self._status_label.setText("Загружаем список файлов…"))
 
     def _after_start(self) -> None:
@@ -472,15 +494,19 @@ class MainWindow(FramelessWindow, QMainWindow):
         if not manual and not is_check_due(self.ctx.config.last_update_check):
             return
         self._update_check_running = True
+        self._update_check_manual = manual
         future = self.ctx.runtime.submit(fetch_latest_release(self.ctx.http.raw))
         future.add_done_callback(self._in_gui(self._after_update_check))
 
     def _after_update_check(self, future) -> None:
         self._update_check_running = False
+        manual = self._update_check_manual
         try:
             release = future.result()
         except Exception as exc:
             log.info("Проверка обновлений не удалась: %s", exc)
+            if manual:
+                self._on_notice("warn", "Не удалось проверить обновления: нет связи с GitHub.")
             return
         cfg = self.ctx.config
         # Запоминаем даже неудачную попытку: иначе каждый запуск без сети
@@ -488,6 +514,8 @@ class MainWindow(FramelessWindow, QMainWindow):
         cfg.last_update_check = time.time()
         if release is None or not should_notify(release, __version__, cfg.last_update_notified):
             self._save_config()
+            if manual:
+                self._on_notice("info", "Обновлений нет — у вас последняя версия.")
             return
         cfg.last_update_notified = release.version
         self._save_config()
@@ -527,6 +555,31 @@ class MainWindow(FramelessWindow, QMainWindow):
             self._on_notice("info", text)
             self.show_workspace()
             self.tabs.setCurrentIndex(1)
+
+    # ------------------------------------------------------------------
+    def _prompt_login(self, text: str) -> None:
+        """Предлагает войти заново: сеанс истёк или нет доступа.
+
+        Молчать об этом нельзя (ТЗ): без нового входа повтор не поможет,
+        поэтому показываем кнопку «Войти».
+        """
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Нужен вход в аккаунт")
+        box.setText(text)
+        login = box.addButton("Войти", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Позже", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is login:
+            self._open_accounts()
+
+    def _notice_error(self, exc: Exception, provider: str | None = None) -> None:
+        """Показывает ошибку; для истёкшего сеанса — с кнопкой «Войти»."""
+        text = friendly_error(exc, provider=provider)
+        if needs_login(exc):
+            self._prompt_login(text)
+        else:
+            self._on_notice("error", text)
 
     # ------------------------------------------------------------------
     def _on_notice(self, level: str, text: str) -> None:
@@ -592,7 +645,12 @@ class MainWindow(FramelessWindow, QMainWindow):
                 sound.play("success")
                 self._notify_hidden("info", "Все загрузки из облака готовы")
         elif job.state.name == "FAILED":
-            self._on_notice("error", f"Файл не скачан: {job.error}")
+            text = f"Файл не скачан: {job.error}"
+            if message_needs_login(job.error or ""):
+                # Истёк сеанс — без нового входа повтор не поможет.
+                self._prompt_login(text)
+            else:
+                self._on_notice("error", text)
             self._notify_hidden("error", f"Не скачан {job.file.name}: {job.error}")
         self._on_snapshot(self.ctx.engine.snapshot())
 
@@ -609,15 +667,59 @@ class MainWindow(FramelessWindow, QMainWindow):
     def _folder_key(file: CloudFile, ctx: BrowseContext) -> tuple:
         return (file.provider.value, file.source.value, ctx.public_key, file.file_id, file.path)
 
+    @staticmethod
+    def _cache_key(pid: ProviderId, ctx: BrowseContext, file: CloudFile | None) -> tuple[str, str, str]:
+        """Ключ листинга: provider|source|path (публичная ссылка/диск — в source)."""
+        scope = ctx.public_key or ctx.drive_id or ""
+        source = f"{ctx.source.value}:{scope}" if scope else ctx.source.value
+        path = file.path if file is not None else (ctx.root_path or "/")
+        return pid.value, source, path
+
     def _load_children(self, file: CloudFile, ctx: BrowseContext, done) -> None:
-        """Асинхронная загрузка содержимого папки (или готовое — из предзагрузки)."""
-        cached = self._prefetched.pop(self._folder_key(file, ctx), None)
-        if cached is not None and time.monotonic() - cached[0] < PREFETCH_TTL:
-            future = cached[1]
+        """Содержимое папки: кэш показываем сразу, свежее — без запроса."""
+        key = self._cache_key(file.provider, ctx, file)
+        prefetched = self._prefetched.pop(self._folder_key(file, ctx), None)
+        if prefetched is not None and time.monotonic() - prefetched[0] < PREFETCH_TTL:
+            prefetched[1].add_done_callback(self._in_gui(
+                lambda fut: self._after_children(fut, done, file, ctx, key, None)))
+            return
+        cached = self.ctx.cache.get_listing(*key)
+        if cached is not None and self.ctx.cache.listing_is_fresh(*cached):
+            done(cached[0])
+            return
+        refresh = cached[0] if cached is not None else None
+        self._request_children(file, ctx, done, key, refresh)
+        if refresh is not None:
+            # Показываем сохранённый список, не дожидаясь сети.
+            done(refresh)
+
+    def _request_children(self, file: CloudFile, ctx: BrowseContext, done, key, refresh) -> None:
+        provider = self.ctx.registry.get(file.provider)
+        future = self.ctx.runtime.submit(provider.list_children(ctx, file))
+        future.add_done_callback(self._in_gui(
+            lambda fut: self._after_children(fut, done, file, ctx, key, refresh)))
+
+    def _after_children(self, future, done, file: CloudFile, ctx: BrowseContext,
+                        key, refresh) -> None:
+        try:
+            items = future.result()
+        except Exception as exc:
+            if refresh is not None:
+                # Устаревший список уже показан — не подменяем его ошибкой.
+                log.info("Папка из кэша, сеть недоступна: %s", exc)
+                self._on_notice(
+                    "warn",
+                    "Не удалось обновить список — показаны сохранённые данные, "
+                    "они могли устареть.",
+                )
+            else:
+                self._deliver(future, done, file.provider.value)
+            return
+        self.ctx.cache.put_listing(*key, items)
+        if refresh is not None:
+            self.tree.refresh_folder(file, ctx, items)
         else:
-            provider = self.ctx.registry.get(file.provider)
-            future = self.ctx.runtime.submit(provider.list_children(ctx, file))
-        future.add_done_callback(self._in_gui(lambda fut: self._deliver(fut, done, file.provider.value)))
+            self._deliver(future, done, file.provider.value)
 
     def _on_folder_hovered(self, file: CloudFile, ctx: BrowseContext) -> None:
         self._hover_folder = (file, ctx)
@@ -647,7 +749,7 @@ class MainWindow(FramelessWindow, QMainWindow):
             files = future.result()
         except Exception as exc:
             log.warning("Не удалось загрузить папку: %s", exc, exc_info=True)
-            self._on_notice("error", friendly_error(exc, provider=provider))
+            self._notice_error(exc, provider=provider)
             done(None)   # None — ошибка: дерево даст раскрыть папку повторно
         else:
             done(files)
@@ -655,9 +757,12 @@ class MainWindow(FramelessWindow, QMainWindow):
     # ------------------------------------------------------------------
     def _open_accounts(self) -> None:
         self.title_bar.set_active("accounts")
-        dialog = AuthDialog(self.ctx.oauth, self.ctx.runtime, self)
+        dialog = AuthDialog(self.ctx.oauth, self.ctx.runtime, self,
+                           engine=self.ctx.engine)
         dialog.login_succeeded.connect(lambda pid, name: self._on_notice("info", f"Вход выполнен: {name}"))
         dialog.login_failed.connect(lambda pid, msg: self._on_notice("error", msg))
+        dialog.logout_requested.connect(
+            lambda pid: self._logout_account(pid, dialog))
 
         def open_settings() -> None:
             # Ключей нет — закрываем «Аккаунты» и ведём в «Настройки»,
@@ -669,9 +774,53 @@ class MainWindow(FramelessWindow, QMainWindow):
         dialog.exec()
         self._restore_nav()
 
+    def _logout_account(self, pid: str, dialog: AuthDialog) -> None:
+        """Выход: сначала ставим на паузу задания этого облака, потом
+        удаляем токен и только затем чистим кэш метаданных провайдера."""
+        try:
+            provider = ProviderId(pid)
+        except ValueError:
+            return
+
+        async def worker() -> ProviderId:
+            for job in list(self.ctx.engine.snapshot()):
+                if job.file.provider is provider and job.state.name in ("QUEUED", "RUNNING"):
+                    await self.ctx.engine.pause(job.job_id)
+            await self.ctx.oauth.logout(provider)
+            # Кэш ссылок и списков — только этого облака: выход из Яндекса
+            # не должен ломать уже открытый Google Диск.
+            self.ctx.cache.clear(provider.value)
+            return provider
+
+        future = self.ctx.runtime.submit(worker())
+        future.add_done_callback(
+            self._in_gui(lambda fut, p=provider: self._after_logout(p, fut, dialog)))
+
+    def _after_logout(self, provider: ProviderId, future, dialog: AuthDialog) -> None:
+        try:
+            future.result()
+        except Exception as exc:
+            log.warning("Выход из аккаунта не удался: %s", exc, exc_info=True)
+            dialog.logout_failed(provider, friendly_error(exc, provider=provider.value))
+            self._on_notice("error", "Не удалось выйти из аккаунта. Подробности — в журнале.")
+            return
+        dialog.logout_finished(provider)
+        self._on_notice("info", "Вы вышли из аккаунта. Публичные ссылки остались.")
+
+    def _on_logged_out(self, pid: str) -> None:
+        try:
+            provider = ProviderId(pid)
+        except ValueError:
+            return
+        # Сбрасываем только «Мой диск»: чужие публичные ссылки этого облака
+        # должны остаться в дереве.
+        self.tree.reset_drive(
+            provider, "войдите в аккаунт («Аккаунты») и раскройте снова")
+
     def _open_settings(self) -> None:
         self.title_bar.set_active("settings")
-        dialog = SettingsDialog(self.ctx.config, self, cache_ops=_PreviewCacheOps(self))
+        dialog = SettingsDialog(self.ctx.config, self, cache_ops=_PreviewCacheOps(self),
+                                cache=self.ctx.cache)
         if dialog.exec() == SettingsDialog.DialogCode.Accepted:
             self.ctx.oauth.reload_config()
             self._apply_ui_prefs()
@@ -719,7 +868,7 @@ class MainWindow(FramelessWindow, QMainWindow):
                 log.info("Ссылка не открылась: %s", exc)
             else:
                 log.warning("Ссылка не открылась: %s", exc, exc_info=True)
-            self._on_notice("error", friendly_error(exc))
+            self._notice_error(exc)
             return
         title = ctx.display_name or provider.display_name
         if self._last_url:
@@ -757,6 +906,12 @@ class MainWindow(FramelessWindow, QMainWindow):
         if logged:
             self.tree.set_subtitle("Мой диск")
 
+    def _refresh_my_drive(self, pid: ProviderId) -> None:
+        """Правый клик «Обновить»: запись кэша сбрасываем и идём в сеть."""
+        ctx = BrowseContext(source=SourceKind.OAUTH, root_path="/", display_name="Мой диск")
+        self.ctx.cache.drop_listing(*self._cache_key(pid, ctx, None))
+        self._open_my_drive_for(pid)
+
     def _open_my_drive_for(self, pid: ProviderId, interactive: bool = True) -> None:
         """Загружает «Мой диск» облака в его постоянный пункт дерева.
 
@@ -773,23 +928,45 @@ class MainWindow(FramelessWindow, QMainWindow):
                 return
         self.tree.set_drive_loading(pid)
         ctx = BrowseContext(source=SourceKind.OAUTH, root_path="/", display_name="Мой диск")
+        key = self._cache_key(pid, ctx, None)
+        cached = self.ctx.cache.get_listing(*key)
+        if cached is not None and self.ctx.cache.listing_is_fresh(*cached):
+            self._render_my_drive(pid, ctx, cached[0], notify=False)
+            return
+        refresh = cached[0] if cached is not None else None
+        if refresh is not None:
+            self._render_my_drive(pid, ctx, refresh, notify=False)
         provider = self.ctx.registry.get(pid)
         future = self.ctx.runtime.submit(provider.list_children(ctx, None))
-        future.add_done_callback(self._in_gui(lambda fut: self._after_my_drive(pid, fut)))
+        future.add_done_callback(self._in_gui(
+            lambda fut: self._after_my_drive(pid, ctx, fut, key, refresh)))
 
-    def _after_my_drive(self, pid: ProviderId, future) -> None:
+    def _render_my_drive(self, pid: ProviderId, ctx: BrowseContext,
+                         items: list[CloudFile], notify: bool = True) -> None:
+        root = self.tree.add_root("Мой диск", ctx, provider=pid)
+        self.tree.set_children(root, items)
+        self.tree.expand_item(root)
+        if notify:
+            self._on_notice("info", f"«Мой диск» открыт: {len(items)} объектов")
+
+    def _after_my_drive(self, pid: ProviderId, ctx: BrowseContext, future,
+                        key, refresh) -> None:
         try:
             items = future.result()
         except Exception as exc:
             log.warning("Не удалось открыть «Мой диск»: %s", exc, exc_info=True)
-            self._on_notice("error", friendly_error(exc, provider=pid.value))
+            if refresh is not None:
+                self._on_notice(
+                    "warn",
+                    "«Мой диск» не обновился — показаны сохранённые данные, "
+                    "они могли устареть.",
+                )
+                return
+            self._notice_error(exc, provider=pid.value)
             self.tree.drive_failed(pid, "не загрузилось — сверните и раскройте снова")
             return
-        ctx = BrowseContext(source=SourceKind.OAUTH, root_path="/", display_name="Мой диск")
-        root = self.tree.add_root("Мой диск", ctx, provider=pid)
-        self.tree.set_children(root, items)
-        self.tree.expand_item(root)
-        self._on_notice("info", f"«Мой диск» открыт: {len(items)} объектов")
+        self.ctx.cache.put_listing(*key, items)
+        self._render_my_drive(pid, ctx, items)
 
     # ------------------------------------------------------------------
     def _on_checked_changed(self, count: int) -> None:
@@ -826,6 +1003,10 @@ class MainWindow(FramelessWindow, QMainWindow):
         groups: dict[tuple[str, ...], list[CloudFile]] = {}
         for file, path in items:
             groups.setdefault(path, []).append(file)
+        checked = self._ensure_space([file for file, _ in items], root)
+        if checked is None:
+            return
+        root = checked
 
         async def enqueue_all():
             jobs = []
@@ -843,7 +1024,9 @@ class MainWindow(FramelessWindow, QMainWindow):
         self._download_files([file])
 
     def _download_files(self, files: list[CloudFile]) -> None:
-        dest = self.ctx.config.download_dir_path
+        dest = self._ensure_space(files, self.ctx.config.download_dir_path)
+        if dest is None:
+            return
         skipped: list[CloudFile] = []
         future = self.ctx.runtime.submit(self.ctx.engine.enqueue(files, dest, skipped))
         future.add_done_callback(self._in_gui(
@@ -985,6 +1168,66 @@ class MainWindow(FramelessWindow, QMainWindow):
             return
         self._on_notice("error", f"Превью: {message}")
 
+    def _on_save_frame(self, image, position_ms: int) -> None:
+        """Сохраняет текущий кадр превью в PNG (ТЗ 4.9)."""
+        player = self.preview_panel.player
+        file = self.preview_panel.current_file
+        if file is None:
+            self._on_notice("warn", "Сначала откройте файл в превью.")
+            return
+        folder = self.ctx.config.download_dir_path
+        stamp = format_timecode(position_ms, player.fps).replace(":", "-").replace(".", "-")
+        target = folder / f"{Path(file.name).stem}_{stamp}.png"
+        if target.exists():
+            answer = QMessageBox.question(
+                self,
+                "Кадр уже сохранён",
+                f"Файл «{target.name}» уже есть в папке загрузок. Сохранить поверх?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        if image is not None and not image.isNull():
+            if image.save(str(target), "PNG"):
+                self._after_frame_saved(target)
+                return
+        # Плеер не отдал кадр (например, кадр ещё не отрисован) — пробуем ffmpeg.
+        if not self.ctx.ffmpeg.available:
+            self._on_notice("error", "Кадр сохранить не удалось: нет ffmpeg и плеер не отдал кадр.")
+            return
+        url = player.url
+        seconds = max(0.0, position_ms / 1000.0)
+
+        async def job() -> bool:
+            return await self.ctx.ffmpeg.frame(url, None, target, seconds)
+
+        future = self.ctx.runtime.submit(job())
+        future.add_done_callback(self._in_gui(lambda fut: self._after_frame_ffmpeg(fut, target)))
+
+    def _after_frame_ffmpeg(self, future, target: Path) -> None:
+        try:
+            ok = future.result()
+        except Exception as exc:
+            log.info("Кадр не сохранён: %s", exc)
+            ok = False
+        if not ok or not target.exists():
+            self._on_notice("error", "Не удалось сохранить кадр в PNG.")
+            return
+        self._after_frame_saved(target)
+
+    def _after_frame_saved(self, target: Path) -> None:
+        """Уведомление о сохранённом кадре с кнопкой «Открыть папку»."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("Кадр сохранён")
+        box.setText(f"Кадр сохранён:\n{target.name}")
+        open_button = box.addButton("Открыть папку", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Ok)
+        box.exec()
+        if box.clickedButton() is open_button:
+            self._open_download_dir()
+
     def _build_proxy(self, session) -> None:
         token = session.token
         # Источник — наш же сервер превью: он сам ходит в облако с нужными
@@ -1041,6 +1284,156 @@ class MainWindow(FramelessWindow, QMainWindow):
             subprocess.Popen(["explorer", "/select,", path])
         else:
             QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def _open_help(self) -> None:
+        HelpDialog(self, on_diagnostics=self._collect_diagnostics,
+                   on_wizard=self.show_setup_wizard).exec()
+
+    def _open_about(self) -> None:
+        """«О программе»: версия, сборка, релиз, лицензии."""
+        from .about_dialog import AboutDialog
+
+        AboutDialog(self,
+                    on_check_updates=lambda: self.check_for_updates(manual=True),
+                    on_diagnostics=self._collect_diagnostics).exec()
+
+    # ------------------------------------------------------------------
+    def show_setup_wizard(self) -> None:
+        """Мастер настройки: ключи, папка загрузок, автозапуск.
+
+        Показывается при первом запуске и по требованию: «Помощь → Мастер
+        настройки».
+        """
+        from .wizard import FirstRunWizard
+
+        def open_accounts() -> None:
+            # Ключи могли поменяться в мастере — перечитать их до входа.
+            self.ctx.oauth.reload_config()
+            self._open_accounts()
+
+        wizard = FirstRunWizard(self.ctx.config, self,
+                                on_accounts=open_accounts,
+                                on_open_link=self._open_link)
+        wizard.exec()
+        self.ctx.oauth.reload_config()
+        self._apply_ui_prefs()
+        self._sync_close_tooltip()
+
+    def _collect_diagnostics(self) -> None:
+        self._on_notice("info", "Собираем диагностику…")
+
+        async def worker():
+            return await asyncio.to_thread(
+                create_diagnostics, None,
+                config=self.ctx.config, oauth=self.ctx.oauth,
+                engine=self.ctx.engine, ffmpeg=self.ctx.ffmpeg)
+
+        future = self.ctx.runtime.submit(worker())
+        future.add_done_callback(self._in_gui(self._after_diagnostics))
+
+    def _after_diagnostics(self, future) -> None:
+        try:
+            path = future.result()
+        except Exception as exc:
+            log.warning("Диагностика не собрана: %s", exc, exc_info=True)
+            self._on_notice("err", f"Не удалось собрать диагностику: {friendly_error(exc)}")
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("Диагностика собрана")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText("Архив с диагностикой готов.")
+        box.setInformativeText(
+            f"{path}\n\nПроверьте содержимое перед отправкой.\n"
+            "Токены и ключи в архив не попадают.")
+        open_btn = box.addButton("Открыть папку", QMessageBox.ButtonRole.ActionRole)
+        box.addButton("Закрыть", QMessageBox.ButtonRole.AcceptRole)
+        box.exec()
+        if box.clickedButton() is open_btn:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
+
+    def _ensure_space(self, files: list[CloudFile], dest: Path) -> Path | None:
+        """Проверяет место перед постановкой в очередь.
+
+        Возвращает папку, в которую можно качать, или None, если
+        пользователь отказался. Место проверяется заново после смены
+        папки — на другом диске свободного места может быть больше.
+        """
+        while True:
+            try:
+                space = check_space(dest, files)
+            except OSError as exc:
+                log.warning("Не удалось проверить папку загрузок: %s", exc, exc_info=True)
+                self._on_notice("err", f"Папка загрузок недоступна: {friendly_error(exc)}")
+                return None
+            if space.ok:
+                return dest
+
+            box = QMessageBox(self)
+            box.setWindowTitle("Недостаточно места")
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setText("Недостаточно места на диске")
+            if space.unknown_count:
+                text = (
+                    f"Размер {space.unknown_count} файл(ов) заранее неизвестен.\n"
+                    f"Нужно не меньше {format_bytes(space.required_bytes)}, "
+                    f"свободно {format_bytes(space.free_bytes)}."
+                )
+            else:
+                text = (
+                    f"Нужно ~{format_bytes(space.required_bytes)}, "
+                    f"свободно {format_bytes(space.free_bytes)}."
+                )
+            box.setInformativeText(
+                text + "\n\nМожно выбрать другую папку или продолжить на свой риск."
+            )
+            choose = box.addButton("Выбрать папку", QMessageBox.ButtonRole.ActionRole)
+            force = box.addButton("Всё равно скачать", QMessageBox.ButtonRole.DestructiveRole)
+            cancel = box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+            cancel.setDefault(True)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is choose:
+                chosen = QFileDialog.getExistingDirectory(
+                    self, "Папка для загрузок", str(dest))
+                if not chosen:
+                    return None
+                dest = Path(chosen)
+                self.ctx.config.download_dir = str(dest)
+                try:
+                    self.ctx.config.save()
+                except OSError as exc:
+                    log.warning("Не удалось сохранить папку загрузок: %s", exc, exc_info=True)
+                    self._on_notice("err", f"Не удалось сохранить папку: {friendly_error(exc)}")
+                    return None
+                continue
+            if clicked is force:
+                return dest
+            return None
+
+    def _export_csv(self) -> None:
+        """Сохраняет текущую очередь в CSV рядом с загрузками."""
+        jobs = self.ctx.engine.snapshot()
+        if not jobs:
+            self._on_notice("warn", "В очереди пока нет загрузок для отчёта.")
+            return
+        path = default_report_path(self.ctx.config.download_dir_path)
+        try:
+            write_report(jobs, path)
+        except OSError as exc:
+            log.warning("Не удалось записать CSV: %s", exc, exc_info=True)
+            self._on_notice("err", f"Не удалось сохранить отчёт: {friendly_error(exc)}")
+            return
+        self._on_notice("info", f"Отчёт сохранён: {path}")
+        box = QMessageBox(self)
+        box.setWindowTitle("Отчёт готов")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText("Список загрузок сохранён в CSV.")
+        box.setInformativeText(str(path))
+        open_btn = box.addButton("Открыть папку", QMessageBox.ButtonRole.ActionRole)
+        box.addButton("Закрыть", QMessageBox.ButtonRole.AcceptRole)
+        box.exec()
+        if box.clickedButton() is open_btn:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
 
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------

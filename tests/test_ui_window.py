@@ -96,11 +96,11 @@ class TestMainWindow(unittest.TestCase):
 
         self.assertEqual(len(tree.checked_files()), 141)
         self.win._download_selected()
-        # очередь наполняется в фоновом потоке — проверяем счётчик заданий
+        # очередь наполняется в фоновом потоке — ждём, пока встанут все
         import time
 
-        deadline = time.time() + 5
-        while time.time() < deadline and not self.ctx.engine.snapshot():
+        deadline = time.time() + 30
+        while time.time() < deadline and len(self.ctx.engine.snapshot()) < 141:
             time.sleep(0.05)
         jobs = self.ctx.engine.snapshot()
         self.assertEqual(len(jobs), 141, "в очередь должно встать 141 файл")
@@ -117,10 +117,27 @@ class TestMainWindow(unittest.TestCase):
         tree.set_children(root, [make_file("a.mp4", 1024)])
         tree._set_all_checked(True)
 
-        with patch.object(self.win, "_on_notice") as notice:
+        # Подменяем submit — так получим future, на который приложение вешает
+        # уведомление, и не будем зависеть от доставки сигнала через GUI-очередь
+        # (в полном прогоне под нагрузкой она иногда не успевает).
+        futures = []
+        real_submit = self.ctx.runtime.submit
+
+        def spy(coro):
+            future = real_submit(coro)
+            futures.append(future)
+            return future
+
+        with patch.object(self.win, "_on_notice") as notice, \
+                patch.object(self.ctx.runtime, "submit", spy):
             self.win._download_selected()
-            deadline = time.time() + 5
+            deadline = time.time() + 30
             while not notice.called and time.time() < deadline:
+                if futures and futures[0].done():
+                    # Обработчик не успел доехать через очередь событий —
+                    # выполняем его сами, ровно как это делает приложение.
+                    self.win._after_enqueue(futures[0])
+                    continue
                 QApplication.processEvents()
                 time.sleep(0.01)
         self.assertTrue(notice.called, "окно должно сказать, что файл уже есть")

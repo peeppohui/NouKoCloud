@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -64,6 +64,43 @@ class CloudFile:
         if self.modified is None:
             return 0.0
         return self.modified.replace(tzinfo=timezone.utc).timestamp()
+
+    def to_dict(self) -> dict:
+        """Плоский вид для кэша листингов: enum'ы и даты — строками."""
+        data: dict = {}
+        for item in fields(self):
+            value = getattr(self, item.name)
+            if isinstance(value, Enum):
+                value = value.value
+            elif isinstance(value, datetime):
+                value = value.isoformat()
+            data[item.name] = value
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "CloudFile":
+        """Обратное к to_dict. Неизвестные поля пропускаем, старые — по умолчанию."""
+        kwargs: dict = {}
+        for item in fields(cls):
+            if item.name not in data:
+                continue
+            value = data[item.name]
+            if value is None:
+                kwargs[item.name] = None
+            elif item.name == "provider":
+                kwargs[item.name] = ProviderId(value)
+            elif item.name == "kind":
+                kwargs[item.name] = EntryKind(value)
+            elif item.name == "source":
+                kwargs[item.name] = SourceKind(value)
+            elif item.name == "modified":
+                try:
+                    kwargs[item.name] = datetime.fromisoformat(str(value))
+                except ValueError:
+                    kwargs[item.name] = None
+            else:
+                kwargs[item.name] = value
+        return cls(**kwargs)
 
 
 @dataclass(slots=True)
@@ -156,6 +193,8 @@ class DownloadJob:
     link_switched: bool = False
     created_at: float = field(default_factory=time.time)
     finished_at: float | None = None
+    #: MD5, реально посчитанный при финальной проверке (для отчёта).
+    md5_actual: str | None = None
     priority: int = 0
     pause_event: "asyncio.Event" = field(default_factory=asyncio.Event, repr=False, compare=False)
     cancel_event: "asyncio.Event" = field(default_factory=asyncio.Event, repr=False, compare=False)

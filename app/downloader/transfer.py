@@ -572,6 +572,7 @@ class Transfer:
                 # иначе битый файл уедет к монтажёру как нормальный.
                 _discard_partial(job)
                 raise IOError("Не удалось прочитать файл для проверки контрольной суммы")
+            job.md5_actual = actual
             if actual.lower() != job.file.md5.lower():
                 # Иначе повтор «докачает» нулевой остаток и снова упрётся в ту же сумму.
                 _discard_partial(job)

@@ -25,6 +25,7 @@ tokens.dat
 .env
 *.part
 *.part.json
+/.noukocloud-parts/
 cache.db
 *.log
 

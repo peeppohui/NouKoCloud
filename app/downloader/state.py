@@ -18,7 +18,9 @@ from ..core.models import CloudFile, DownloadJob, EntryKind, ProviderId, Segment
 
 log = logging.getLogger(__name__)
 
+#: Версия формата для чтения старых файлов; пишем всегда текущую.
 VERSION = 1
+STATE_VERSION = 2
 
 
 def _file_to_dict(file: CloudFile) -> dict:
@@ -60,6 +62,7 @@ def save_state(job: DownloadJob) -> None:
     """Сохраняет прогресс сегментов на диск."""
     payload = {
         "version": VERSION,
+        "state_version": STATE_VERSION,
         "file": _file_to_dict(job.file),
         "dest": str(job.dest_dir),
         "total": job.total_bytes,
@@ -89,7 +92,15 @@ def load_state(path: Path) -> Optional[tuple[CloudFile, int, list[Segment]]]:
     except (OSError, json.JSONDecodeError) as exc:
         log.warning("Состояние %s повреждено: %s", path, exc)
         return None
-    if payload.get("version") != VERSION:
+    if not isinstance(payload, dict):
+        return None
+    try:
+        version = int(payload.get("state_version", payload.get("version", 1)))
+    except (TypeError, ValueError):
+        return None
+    if version > STATE_VERSION:
+        # Файл новее программы: не рискуем испортить сегменты.
+        log.warning("Состояние %s новее программы (v%s)", path, version)
         return None
     try:
         file = _file_from_dict(payload["file"])
@@ -98,7 +109,7 @@ def load_state(path: Path) -> Optional[tuple[CloudFile, int, list[Segment]]]:
             Segment(index=int(s["index"]), start=int(s["start"]), end=int(s["end"]), received=int(s.get("received", 0)))
             for s in payload.get("segments", [])
         ]
-    except (KeyError, TypeError, ValueError) as exc:
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
         log.warning("Состояние %s не разобрано: %s", path, exc)
         return None
     if total and segments and sum(seg.total for seg in segments) != total:
@@ -114,6 +125,8 @@ def state_dest(path: Path) -> Path | None:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+    if not isinstance(payload, dict):
+        return None
     dest = payload.get("dest")
     return Path(dest) if dest else None
 
@@ -125,6 +138,8 @@ def state_job_state(path: Path) -> str | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
         return None
     value = payload.get("job_state")
     return str(value) if value else None

@@ -112,6 +112,28 @@ class FfmpegTools:
             return False
         return True
 
+    async def frame(self, url: str, headers: dict[str, str] | None, out_path: Path,
+                    at_seconds: float = 0.0) -> bool:
+        """Сохраняет кадр видео в PNG (экспорт кадра из превью)."""
+        if not self._path:
+            return False
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        args = [
+            "-hide_banner", "-loglevel", "error",
+            "-ss", f"{max(0.0, at_seconds):.3f}",
+            *self._headers_arg(headers or {}), "-i", url,
+            "-frames:v", "1", "-y", str(out_path),
+        ]
+        try:
+            code, _out, err = await self._run(args, timeout=120)
+        except Exception as exc:
+            log.info("Кадр не сохранён: %s", exc)
+            return False
+        if code != 0 or not out_path.exists():
+            log.info("ffmpeg не смог сохранить кадр: %s", err.decode("utf-8", "ignore")[:200])
+            return False
+        return True
+
     async def build_proxy(self, url: str, headers: dict[str, str] | None, out_path: Path,
                           max_height: int = 480, seconds: int = 60) -> bool:
         """Перекодирует начало файла в mp4 (H.264/AAC) для браузера."""

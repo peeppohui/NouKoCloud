@@ -6,12 +6,14 @@ import asyncio
 import logging
 import os
 import re
+import shutil
 import time
 from dataclasses import replace
 from pathlib import Path
 
 from ..core.bus import Bus
 from ..core.config import AppConfig
+from ..core.diskspace import LOW_SPACE_BYTES
 from ..core.errors import friendly_error
 from ..core.models import CloudFile, DownloadJob, JobState
 from ..net.http_client import HttpClient
@@ -105,6 +107,9 @@ class DownloadEngine:
         #: следующего куска данных от медленного облака.
         self._tasks: dict[str, asyncio.Task] = {}
         self._speed_state: dict[str, tuple[float, int]] = {}
+        #: Свободное место проверяем не чаще раза в 5 секунд.
+        self._space_checked_at = 0.0
+        self._space_low = False
 
     # ------------------------------------------------------------------
     async def start(self) -> None:
@@ -189,7 +194,10 @@ class DownloadEngine:
                 taken[job.file.name.lower()] = job.file
         stem, suffix = os.path.splitext(name)
         for attempt in range(1000):
-            candidate = name if attempt == 0 else f"{stem} ({attempt + 1}){suffix}"
+            # Нумерация как в Transfer._pick_target_name: «имя (1).ext»,
+            # а не «имя (2).ext» — иначе предварительный выбор имени в
+            # очереди и фактическая запись на диск расходились.
+            candidate = name if attempt == 0 else f"{stem} ({attempt}){suffix}"
             other = taken.get(candidate.lower())
             if other is not None:
                 if _same_file(other, file):
@@ -268,6 +276,23 @@ class DownloadEngine:
             job.pause_event.clear()
             job.state = JobState.PAUSED
             self._emit_snapshot()
+
+    async def retry(self, job_id: str) -> None:
+        """Повторяет именно упавшую загрузку, не трогая остальные состояния."""
+        job = self._jobs.get(job_id)
+        if job is None or job.state is not JobState.FAILED:
+            return
+        # Новый цикл попыток: старые ошибки и счётчик не должны пугать
+        # пользователя и мешать повторам внутри Transfer.
+        job.attempts = 0
+        await self.resume(job_id)
+
+    async def retry_failed(self) -> int:
+        """Повторяет все упавшие задания в исходном порядке очереди."""
+        failed = [job.job_id for job in self.snapshot() if job.state is JobState.FAILED]
+        for job_id in failed:
+            await self.retry(job_id)
+        return len(failed)
 
     async def resume(self, job_id: str) -> None:
         """Продолжает паузу, повторяет ошибку или возвращает отменённую загрузку."""
@@ -364,8 +389,19 @@ class DownloadEngine:
             self._queued.discard(job_id)
             try:
                 job = self._jobs.get(job_id)
-                if job is not None and job.state is not JobState.CANCELLED:
-                    await self._run_job(job)
+                if job is None or job.state is JobState.CANCELLED:
+                    continue
+                # Пауза, поставленная до старта задания, должна уважаться:
+                # раньше рабочий всё равно запускал его и переводил в RUNNING.
+                if job.state is JobState.PAUSED:
+                    continue
+                if self._space_low and not self._has_room(job.dest_dir):
+                    job.pause_event.clear()
+                    job.state = JobState.PAUSED
+                    self._emit_snapshot()
+                    continue
+                self._space_low = False
+                await self._run_job(job)
             finally:
                 # task_done — строго для каждого взятого задания, иначе
                 # очередь не сойдётся.
@@ -421,7 +457,11 @@ class DownloadEngine:
             log.warning("Не скачано %s: %s", job.file.name, exc, exc_info=True)
         else:
             if ok:
-                job.state = JobState.DONE
+                # Transfer уже мог пометить файл как SKIPPED: он лежал на
+                # диске и качать его не пришлось. Не перезаписываем это
+                # состояние на DONE — иначе в очереди теряется причина.
+                if job.state is not JobState.SKIPPED:
+                    job.state = JobState.DONE
             else:
                 job.state = JobState.FAILED
             job.finished_at = time.time()
@@ -453,6 +493,7 @@ class DownloadEngine:
     # ------------------------------------------------------------------
     def _on_progress(self, job: DownloadJob) -> None:
         now = time.monotonic()
+        self._check_free_space(job, now)
         self._update_speed(job, now)
         # Троттлинг — на каждое задание, а не на весь движок: иначе при
         # четырёх файлах только один получал обновление, а у остальных
@@ -468,6 +509,49 @@ class DownloadEngine:
             except Exception as exc:
                 # Состояние не пишется — после обрыва придётся качать заново.
                 log.warning("Не удалось сохранить состояние загрузки: %s", exc)
+
+    @staticmethod
+    def _free_bytes(directory: Path) -> int | None:
+        try:
+            return shutil.disk_usage(directory).free
+        except OSError:
+            return None
+
+    def _has_room(self, directory: Path) -> bool:
+        free = self._free_bytes(directory)
+        # Не смогли узнать — не мешаем загрузке: ошибку покажет запись.
+        return free is None or free >= LOW_SPACE_BYTES
+
+    def _check_free_space(self, job: DownloadJob, now: float) -> None:
+        """Не даём загрузкам забить диск до нуля: пауза вместо ошибки записи."""
+        if now - self._space_checked_at < 5.0:
+            return
+        self._space_checked_at = now
+        free = self._free_bytes(job.dest_dir)
+        if free is None:
+            return
+        if free >= LOW_SPACE_BYTES:
+            if self._space_low:
+                self._space_low = False
+                log.info("Место на диске освободилось — загрузки можно продолжить")
+            return
+        if self._space_low:
+            return
+        self._space_low = True
+        paused = 0
+        for other in self._jobs.values():
+            if other.state in (JobState.QUEUED, JobState.RUNNING):
+                other.pause_event.clear()
+                other.state = JobState.PAUSED
+                paused += 1
+        if paused:
+            self._emit_snapshot()
+            self._bus.notice.emit(
+                "err",
+                "Мало места на диске. Освободите место и нажмите «Продолжить».",
+            )
+            log.warning("Мало места на диске (свободно %d байт) — %d загрузок на паузе",
+                        free, paused)
 
     def _update_speed(self, job: DownloadJob, now: float) -> None:
         """Скорость считаем скользящим окном в 3 секунды."""

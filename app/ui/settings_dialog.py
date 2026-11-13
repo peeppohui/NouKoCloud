@@ -53,12 +53,13 @@ def human_size(size: int) -> str:
 
 class SettingsDialog(OverlayDialog):
     def __init__(self, config: AppConfig, parent: QWidget | None = None,
-                 cache_ops: CacheOps | None = None) -> None:
+                 cache_ops: CacheOps | None = None, cache=None) -> None:
         # В Soyuz Grotesk нет буквы «й» — её набираем шрифтом Actay Wide (как в макете).
         super().__init__(
             f'настро<span style="font-family:\'{theme.WIDE}\'">й</span>ки', parent, max_width=1000)
         self._config = config
         self._cache_ops = cache_ops
+        self._cache = cache
         self.setWindowTitle("Настройки")
 
         columns = QBoxLayout(QBoxLayout.Direction.LeftToRight)
@@ -341,6 +342,21 @@ class SettingsDialog(OverlayDialog):
         logs.addWidget(self._log_level)
         logs.addStretch(1)
         right.addWidget(logs_box)
+
+        data_box = QGroupBox("КЭШ МЕТАДАННЫХ", self.body)
+        data = QVBoxLayout(data_box)
+        data.setSpacing(8)
+        self._meta_clear = button("Очистить кэш метаданных", "soft", data_box)
+        self._meta_clear.setToolTip(
+            "Списки папок, сохранённые для быстрого открытия. "
+            "Скачанные файлы и входы в аккаунты не затрагиваются."
+        )
+        self._meta_clear.clicked.connect(self._clear_metadata_cache)
+        data.addWidget(self._meta_clear)
+        data.addWidget(label(
+            "Списки обновятся при следующем открытии папки.",
+            "hint", data_box, wrap=True))
+        right.addWidget(data_box)
         right.addStretch(1)
 
         self._dir.textChanged.connect(self._update_cache_info)
@@ -411,6 +427,20 @@ class SettingsDialog(OverlayDialog):
             message += f" Не удалось удалить файлов: {failed} — они ещё используются, попробуйте позже."
         self._cache_usage.setToolTip(message)
         self._cache_usage.setText(self._cache_usage.text() + "  ·  " + message)
+
+    def _clear_metadata_cache(self) -> None:
+        if self._cache is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Кэш метаданных",
+            "Удалить сохранённые списки папок? Скачанные файлы и входы в аккаунты останутся.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._cache.clear_metadata()
+        self._meta_clear.setToolTip("Кэш метаданных очищен")
 
     def _ask_clear_old_cache(self, old: Path, size: int) -> bool:
         """Спрашиваем, удалить ли кэш из прежней папки (вынесено — для тестов)."""

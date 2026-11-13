@@ -14,11 +14,21 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QModelIndex, QSize, Qt, Signal
-from PySide6.QtGui import QAction, QBrush, QColor, QKeySequence, QStandardItem, QStandardItemModel
+from PySide6.QtCore import QModelIndex, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QAction,
+    QBrush,
+    QColor,
+    QKeySequence,
+    QShortcut,
+    QStandardItem,
+    QStandardItemModel,
+)
 from PySide6.QtWidgets import (
+    QComboBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMenu,
     QPushButton,
     QSizePolicy,
@@ -49,7 +59,41 @@ VIDEO_EXT = (".mp4", ".mov", ".mkv", ".avi", ".mxf", ".mts", ".m2ts", ".webm", "
 AUDIO_EXT = (".wav", ".mp3", ".flac", ".aac", ".m4a", ".ogg", ".opus", ".wma", ".aif", ".aiff")
 IMAGE_EXT = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff", ".heic",
              ".dng", ".cr2", ".cr3", ".nef", ".arw", ".psd")
+DOC_EXT = (".pdf", ".doc", ".docx", ".txt", ".rtf", ".xls", ".xlsx", ".ppt", ".pptx",
+           ".odt", ".ods", ".odp", ".csv", ".epub", ".xml", ".json", ".srt", ".vtt")
 
+#: Фильтр по типу: значение и подпись в списке.
+TYPE_CHOICES: tuple[tuple[str, str], ...] = (
+    ("all", "Все"),
+    ("video", "Видео"),
+    ("audio", "Аудио"),
+    ("image", "Фото"),
+    ("doc", "Документы"),
+    ("other", "Другое"),
+)
+SEARCH_DEBOUNCE_MS = 180
+
+
+def normalize_search(text: str) -> str:
+    """Одинаковый вид для сравнения: без регистра, «ё» считается «е»."""
+    return (text or "").casefold().replace("ё", "е")
+
+
+def file_type_group(file: CloudFile) -> str:
+    """Группа файла для фильтра по типу: video/audio/image/doc/other.
+
+    Расширения берём те же, что для иконок дерева (общий список с превью).
+    """
+    if file.kind is EntryKind.FOLDER:
+        return "folder"
+    icon = file_icon_name(file)
+    if icon in ("video", "audio", "image"):
+        return icon
+    name = file.name.lower()
+    mime = (file.mime or "").lower()
+    if name.endswith(DOC_EXT) or mime.startswith("text/") or mime == "application/pdf":
+        return "doc"
+    return "other"
 
 def file_icon_name(file: CloudFile) -> str:
     """Иконка строки: папка, видео, звук, картинка или документ."""
@@ -207,6 +251,10 @@ class FileTree(QWidget):
         self._no_autoload = False
         self._groups: dict[ProviderId, QStandardItem] = {}
         self._drives: dict[ProviderId, QStandardItem] = {}
+        self._filtering = False                       # фильтр раскрывает узлы — без загрузок
+        self._filter_active = False
+        self._match_count = 0
+        self._saved_expanded: Optional[set[tuple[int, ...]]] = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -232,6 +280,55 @@ class FileTree(QWidget):
         top.addWidget(self._btn_all)
         top.addWidget(self._btn_none)
         layout.addLayout(top)
+
+        # --- поиск и фильтр по типу -------------------------------------
+        search_row = QHBoxLayout()
+        search_row.setContentsMargins(20, 0, 20, 0)
+        search_row.setSpacing(8)
+        self._search = QLineEdit(self)
+        self._search.setPlaceholderText("Поиск по имени…")
+        self._search.setClearButtonEnabled(True)
+        self._search.setMinimumWidth(180)
+        search_row.addWidget(self._search, 1)
+        self._type = QComboBox(self)
+        for value, label in TYPE_CHOICES:
+            self._type.addItem(label, value)
+        self._type.setToolTip("Фильтр по типу файла")
+        search_row.addWidget(self._type)
+        self._count_label = QLabel("", self)
+        self._count_label.setProperty("muted", True)
+        self._count_label.hide()
+        search_row.addWidget(self._count_label)
+        self._reset_btn = QPushButton("Сбросить", self)
+        self._reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._reset_btn.hide()
+        search_row.addWidget(self._reset_btn)
+        layout.addLayout(search_row)
+
+        self._filter_hint = QLabel("", self)
+        self._filter_hint.setProperty("muted", True)
+        self._filter_hint.setWordWrap(True)
+        self._filter_hint.setContentsMargins(20, 0, 20, 0)
+        self._filter_hint.hide()
+        layout.addWidget(self._filter_hint)
+
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(SEARCH_DEBOUNCE_MS)
+        self._search_timer.timeout.connect(self._apply_filter)
+        self._search.textChanged.connect(self._on_filter_changed)
+        self._search.returnPressed.connect(self._apply_filter_now)
+        self._type.currentIndexChanged.connect(self._on_filter_changed)
+        self._reset_btn.clicked.connect(self.clear_filter)
+
+        find_shortcut = QShortcut(QKeySequence.StandardKey.Find, self)
+        find_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        find_shortcut.activated.connect(self.focus_search)
+        escape_shortcut = QShortcut(QKeySequence("Esc"), self)
+        escape_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        escape_shortcut.activated.connect(self.clear_filter)
+        self._find_shortcut = find_shortcut
+        self._escape_shortcut = escape_shortcut
 
         self._view = QTreeView(self)
         # Флажки рисует тема (theme.stylesheet): в стиле Windows 11 пустые
@@ -281,6 +378,167 @@ class FileTree(QWidget):
         """Подпись рядом с заголовком: что открыто последним."""
         self._subtitle.setText(text)
         self._subtitle.setToolTip(text)
+
+    # ------------------------------------------------------------------
+    # Поиск и фильтр по типу
+    # ------------------------------------------------------------------
+    def _on_filter_changed(self, *_args) -> None:
+        """Ввод с debounce: фильтрация запускается через 180 мс после нажатия."""
+        self._search_timer.start()
+
+    def _apply_filter_now(self) -> None:
+        self._search_timer.stop()
+        self._apply_filter()
+
+    def focus_search(self) -> None:
+        """Ctrl+F — курсор в поле поиска, старое значение выделено."""
+        self._search.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self._search.selectAll()
+
+    def filter_active(self) -> bool:
+        return self._filter_active
+
+    def search_text(self) -> str:
+        return self._search.text()
+
+    def clear_filter(self) -> None:
+        """Сброс поиска и фильтра — с восстановлением раскрытия дерева."""
+        self._search_timer.stop()
+        widgets = (self._search, self._type)
+        for widget in widgets:
+            widget.blockSignals(True)
+        try:
+            self._search.clear()
+            self._type.setCurrentIndex(0)
+        finally:
+            for widget in widgets:
+                widget.blockSignals(False)
+        self._apply_filter()
+        self._view.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _apply_filter(self) -> None:
+        """Скрывает всё, что не совпало, оставляя родителей совпадений.
+
+        Ищет только по уже загруженным узлам: сетевых запросов здесь нет,
+        раскрытие родителей идёт с флагом _filtering и не просит содержимое.
+        """
+        self._search_timer.stop()
+        text = normalize_search(self._search.text().strip())
+        group = self._type.currentData() or "all"
+        if not text and group == "all":
+            if self._filter_active:
+                self._restore_after_filter()
+            else:
+                self._update_filter_ui(active=False)
+            return
+        if not self._filter_active:
+            self._saved_expanded = {self._item_path(item) for item in self._expanded_items()}
+            self._filter_active = True
+        self._filtering = True
+        try:
+            self._match_count = 0
+            self._filter_children(self._model.invisibleRootItem(), QModelIndex(), text, group)
+        finally:
+            self._filtering = False
+        self._update_filter_ui(active=True, empty=self._match_count == 0)
+
+    def _filter_children(self, parent: QStandardItem, parent_index, text: str,
+                         group: str) -> bool:
+        """Прячет детей parent; True — если хоть что-то внутри осталось видимым."""
+        visible_any = False
+        for row in range(parent.rowCount()):
+            child = parent.child(row)
+            if child is None:
+                continue
+            if child.data(HINT_ROLE):
+                self._view.setRowHidden(row, parent_index, True)
+                continue
+            child_index = self._model.indexFromItem(child)
+            file = child.data(FILE_ROLE)
+            direct = isinstance(file, CloudFile) and self._node_matches(file, text, group)
+            descendant = self._filter_children(child, child_index, text, group) \
+                if child.rowCount() else False
+            visible = direct or descendant
+            self._view.setRowHidden(row, parent_index, not visible)
+            if direct:
+                self._match_count += 1
+            if visible:
+                visible_any = True
+                if descendant:
+                    self._view.expand(child_index)
+        return visible_any
+
+    @staticmethod
+    def _node_matches(file: CloudFile, text: str, group: str) -> bool:
+        """Совпадение самого узла: папки под фильтром типа видны только через детей."""
+        if group != "all":
+            if not file.is_file or file_type_group(file) != group:
+                return False
+        return not text or text in normalize_search(file.name)
+
+    def _restore_after_filter(self) -> None:
+        """Снимает скрытие строк и возвращает раскрытие, бывшее до поиска."""
+        saved = self._saved_expanded or set()
+        self._filtering = True
+        try:
+            self._unhide_children(self._model.invisibleRootItem(), QModelIndex())
+            for item in list(self._all_items()):
+                index = self._model.indexFromItem(item)
+                expanded = self._view.isExpanded(index)
+                wanted = self._item_path(item) in saved
+                if wanted and not expanded:
+                    self._view.expand(index)
+                elif expanded and not wanted:
+                    self._view.collapse(index)
+        finally:
+            self._filtering = False
+        self._filter_active = False
+        self._saved_expanded = None
+        self._update_filter_ui(active=False)
+
+    def _unhide_children(self, parent: QStandardItem, parent_index) -> None:
+        for row in range(parent.rowCount()):
+            child = parent.child(row)
+            if child is None:
+                continue
+            self._view.setRowHidden(row, parent_index, False)
+            if child.rowCount():
+                self._unhide_children(child, self._model.indexFromItem(child))
+
+    def _update_filter_ui(self, active: bool, empty: bool = False) -> None:
+        self._count_label.setVisible(active)
+        self._reset_btn.setVisible(active and empty)
+        if not active:
+            self._count_label.setText("")
+            self._filter_hint.hide()
+            return
+        self._count_label.setText(f"Найдено: {self._match_count}")
+        if empty:
+            self._filter_hint.setText("Ничего не найдено")
+            self._filter_hint.show()
+        elif self._has_unloaded():
+            self._filter_hint.setText("В неоткрытых папках поиск не ищет — раскройте папку")
+            self._filter_hint.show()
+        else:
+            self._filter_hint.hide()
+
+    def _has_unloaded(self) -> bool:
+        """Есть ли папки, содержимое которых ещё не загружено (поиск туда не смотрит)."""
+        for item in self._all_items():
+            if not item.data(LOADED_ROLE):
+                if item.data(DRIVE_ROLE) or item.data(IS_DIR_ROLE):
+                    return True
+        return False
+
+    def _item_path(self, item: QStandardItem) -> tuple[int, ...]:
+        """Путь по строкам от корня — переживает перестановки при сортировке."""
+        path: list[int] = []
+        node: Optional[QStandardItem] = item
+        while node is not None:
+            path.append(node.row())
+            node = node.parent()
+        path.reverse()
+        return tuple(path)
 
     # --- иконки и цвета темы ---------------------------------------------
     @staticmethod
@@ -371,9 +629,37 @@ class FileTree(QWidget):
         """«Мой диск» не загрузился: подсказка внутри, раскрыть можно снова."""
         drive = self._drives[pid]
         drive.setData(False, LOADED_ROLE)
+        self._forget_pending_under(drive)
         self._set_hint(drive, text)
         self._view.collapse(drive.index())
         self._emit_checked()
+
+    def reset_drive(self, pid: ProviderId, text: str = DRIVE_HINT) -> None:
+        """Сбрасывает только «Мой диск» после выхода из аккаунта.
+
+        Публичные ссылки этого же облака остаются на месте: выход из
+        аккаунта не должен закрывать чужую папку, открытую по ссылке.
+        Ответы на ещё летящие запросы забываем, иначе старый аккаунт
+        успел бы снова наполнить дерево после сброса.
+        """
+        drive = self._drives[pid]
+        drive.setData(False, LOADED_ROLE)
+        drive.setData(BrowseContext(source=SourceKind.OAUTH, root_path="/", display_name=MY_DRIVE),
+                      CTX_ROLE)
+        self._forget_pending_under(drive)
+        self._set_hint(drive, text)
+        self._view.collapse(drive.index())
+        self._emit_checked()
+
+    def _forget_pending_under(self, item: QStandardItem) -> None:
+        """Убирает из ожидания ответы для item и всех его потомков."""
+        for token, pending in list(self._pending.items()):
+            node = pending
+            while node is not None:
+                if node is item:
+                    del self._pending[token]
+                    break
+                node = node.parent()
 
     def _request_drive(self, pid: ProviderId) -> None:
         self.set_drive_loading(pid)
@@ -499,7 +785,11 @@ class FileTree(QWidget):
         self._model.clear()
         self._model.setHorizontalHeaderLabels(HEADER_LABELS)
         self._pending.clear()
+        # Модель пересобрана — прежнее раскрытие к новым строкам не относится.
+        self._filter_active = False
+        self._saved_expanded = None
         self._build_groups()
+        self._apply_filter()
 
     # ------------------------------------------------------------------
     def _icon_for_folder(self):
@@ -521,21 +811,67 @@ class FileTree(QWidget):
         # а детей добавляет item (у модели appendRow принимает один аргумент).
         parent_index = self._model.indexFromItem(parent_item)
         count = self._model.rowCount(parent_index)
+        # Обновление листинга не должно снимать отметки пользователя.
+        checked: set[tuple[str, str, str]] = set()
+        if count:
+            for row in range(count):
+                child = parent_item.child(row, 0)
+                value = child.data(FILE_ROLE) if child is not None else None
+                if isinstance(value, CloudFile) and value.is_file \
+                        and child.checkState() == Qt.CheckState.Checked:
+                    checked.add((value.provider.value, value.file_id, value.path))
         if count:
             self._model.removeRows(0, count, parent_index)
         # Файлы сразу встают в порядке текущей сортировки.
         for file in self._model.sorted_files(files):
-            parent_item.appendRow(self._make_row(file, parent_item.data(CTX_ROLE)))
+            row = self._make_row(file, parent_item.data(CTX_ROLE))
+            parent_item.appendRow(row)
+            if file.is_file and (file.provider.value, file.file_id, file.path) in checked:
+                row[0].setCheckState(Qt.CheckState.Checked)
         parent_item.setData(True, LOADED_ROLE)
         # Папку отметили до того, как пришло её содержимое: отмечаем и его,
         # иначе «Скачать выбранное» молча пропустит всё внутри.
         if parent_item.isCheckable() and parent_item.checkState() == Qt.CheckState.Checked:
             self._propagate(parent_item, Qt.CheckState.Checked)
             self._emit_checked()
+        if self._filter_active:
+            # Данные обновились/догрузились — фильтр должен остаться верным.
+            self._apply_filter()
 
     def expand_item(self, item: QStandardItem) -> None:
         """Раскрывает элемент дерева (разворачивание живёт во view, не в item)."""
         self._view.expand(self._model.indexFromItem(item))
+
+    def refresh_folder(self, file: CloudFile, ctx: BrowseContext, files: list[CloudFile]) -> bool:
+        """Тихо обновляет уже показанную папку после фоновой загрузки.
+
+        Отметки файлов сохраняются, раскрытие не меняется. Если список тот же,
+        дерево вообще не трогаем — иначе пропали бы отметки и курсор.
+        """
+        for item in self._all_items():
+            if item.data(FILE_ROLE) is not file or not item.data(LOADED_ROLE):
+                continue
+            if item.data(CTX_ROLE) is not ctx:
+                continue
+            if self._same_listing(item, files):
+                return True
+            self.set_children(item, files)
+            return True
+        return False
+
+    @staticmethod
+    def _listing_signature(files: list[CloudFile]) -> list[tuple]:
+        return sorted(
+            (f.file_id, f.name, f.kind.value, f.size, f.modified_ts) for f in files
+        )
+
+    def _same_listing(self, item: QStandardItem, files: list[CloudFile]) -> bool:
+        current = [
+            child.data(FILE_ROLE)
+            for child in (item.child(row, 0) for row in range(item.rowCount()))
+        ]
+        current_files = [f for f in current if isinstance(f, CloudFile)]
+        return self._listing_signature(current_files) == self._listing_signature(files)
 
     def _make_row(self, file: CloudFile, ctx: Optional[BrowseContext]) -> list[QStandardItem]:
         name = QStandardItem(file.name)
@@ -606,6 +942,9 @@ class FileTree(QWidget):
 
     # ------------------------------------------------------------------
     def _on_expanded(self, index) -> None:
+        if self._filtering:
+            # Фильтр раскрывает родителей совпадений — это не просьба о загрузке.
+            return
         item = self._model.itemFromIndex(index)
         if item is None:
             return

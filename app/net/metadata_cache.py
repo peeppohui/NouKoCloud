@@ -20,6 +20,17 @@ from ..core.paths import app_data_dir
 
 log = logging.getLogger(__name__)
 
+#: Версия схемы кэша (PRAGMA user_version). Растёт при изменении таблиц.
+SCHEMA_VERSION = 2
+#: Сколько показывать листинг без повторного запроса к облаку.
+ENTRY_TTL = 300.0
+#: Пустой ответ кэшируем ненадолго: папку могли только что наполнить.
+EMPTY_TTL = 30.0
+#: Пределы размера кэша: старые записи удаляются.
+MAX_ENTRIES = 10_000
+MAX_BYTES = 50 * 1024 * 1024
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS entries (
     key         TEXT PRIMARY KEY,
@@ -31,6 +42,7 @@ CREATE TABLE IF NOT EXISTS entries (
     updated_at  REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_entries_lookup ON entries (provider, source, path);
+CREATE INDEX IF NOT EXISTS idx_entries_updated ON entries (updated_at);
 
 CREATE TABLE IF NOT EXISTS links (
     key         TEXT PRIMARY KEY,
@@ -68,6 +80,12 @@ class MetadataCache:
                 raise sqlite3.DatabaseError(f"quick_check: {row[0] if row else '?'}")
             conn.executescript(SCHEMA)
             conn.execute("PRAGMA journal_mode=WAL")
+            # Миграция схемы: PRAGMA user_version хранится в самом файле и
+            # переживает перезапуск. Все шаги идемпотентны (IF NOT EXISTS).
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if version < SCHEMA_VERSION:
+                conn.executescript(SCHEMA)
+                conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             # Старые версии сохраняли сюда заголовок Authorization открытым текстом.
             conn.execute("DELETE FROM links WHERE headers LIKE '%uthorization%'")
             conn.commit()
@@ -104,27 +122,116 @@ class MetadataCache:
                  json.dumps(payload, ensure_ascii=False), modified_ts, time.time()),
             )
             self._conn.commit()
+            self._prune()
 
     def get_entry(self, provider: str, source: str, path: str) -> dict[str, Any] | None:
+        """Сырая запись раздела (для проверок и отладки)."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT payload FROM entries WHERE key = ?", (self._entry_key(provider, source, path),)
+                "SELECT payload FROM entries WHERE key = ?",
+                (self._entry_key(provider, source, path),),
             ).fetchone()
-        if not row:
+        if row is None:
             return None
         try:
-            return json.loads(row["payload"])
+            payload = json.loads(row["payload"])
         except json.JSONDecodeError:
             return None
+        return payload if isinstance(payload, dict) else None
+
+    def put_listing(self, provider: str, source: str, path: str,
+                    files: list, modified_ts: float | None = None) -> None:
+        """Кладёт листинг папки. Файлы пишутся плоским JSON (CloudFile.to_dict)."""
+        payload = {"files": [f.to_dict() for f in files]}
+        if modified_ts is None:
+            modified_ts = max((f.modified_ts for f in files), default=0.0)
+        self.put_entry(provider, source, path, payload, modified_ts)
+
+    def get_listing(self, provider: str, source: str, path: str):
+        """(list[CloudFile], updated_at) или None. Битые записи считаются промахом."""
+        from ..core.models import CloudFile
+
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT payload, updated_at FROM entries WHERE key = ?",
+                (self._entry_key(provider, source, path),),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            raw = json.loads(row["payload"])
+            files = [CloudFile.from_dict(item) for item in raw.get("files", [])]
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            return None
+        return files, float(row["updated_at"])
+
+    @staticmethod
+    def listing_is_fresh(files: list, updated_at: float, now: float | None = None) -> bool:
+        """Свежесть листинга: пустой ответ живёт 30 секунд, обычный — 5 минут."""
+        ttl = EMPTY_TTL if not files else ENTRY_TTL
+        return ((now if now is not None else time.time()) - updated_at) <= ttl
+
+    def drop_listing(self, provider: str, source: str, path: str) -> None:
+        """Инвалидирует запись: ручное «Обновить» должно идти в сеть."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM entries WHERE key = ?", (self._entry_key(provider, source, path),)
+            )
+            self._conn.commit()
 
     def clear(self, provider: str | None = None) -> None:
+        """Чистит метаданные и ссылки.
+
+        С указанием провайдера трогаем только его записи: выход из Яндекса
+        не должен сбрасывать живые ссылки Google. Полная очистка (provider
+        is None) по-прежнему удаляет всё.
+        """
         with self._lock:
             if provider:
                 self._conn.execute("DELETE FROM entries WHERE provider = ?", (provider,))
+                # Ключ ссылки: provider|source|path|file_id (см. providers/base.py).
+                # LIKE с экранированием не нужен: provider — это 'yandex'/'google'
+                # без символов шаблона, а префикс отделён вертикальной чертой.
+                self._conn.execute(
+                    "DELETE FROM links WHERE key LIKE ?", (f"{provider}|%",)
+                )
             else:
                 self._conn.execute("DELETE FROM entries")
-            self._conn.execute("DELETE FROM links")
+                self._conn.execute("DELETE FROM links")
             self._conn.commit()
+
+    def clear_metadata(self, provider: str | None = None) -> int:
+        """Удаляет только листинги (кэш метаданных), не трогая ссылки."""
+        with self._lock:
+            if provider:
+                cur = self._conn.execute("DELETE FROM entries WHERE provider = ?", (provider,))
+            else:
+                cur = self._conn.execute("DELETE FROM entries")
+            self._conn.commit()
+            return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+    def _prune(self) -> None:
+        """Держит кэш в пределах MAX_ENTRIES и MAX_BYTES: старые — первыми."""
+        count = self._conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+        if count > MAX_ENTRIES:
+            self._conn.execute(
+                "DELETE FROM entries WHERE key IN "
+                "(SELECT key FROM entries ORDER BY updated_at LIMIT ?)",
+                (count - MAX_ENTRIES,),
+            )
+        try:
+            size = self._path.stat().st_size if self._path.exists() else 0
+        except OSError:
+            size = 0
+        if size > MAX_BYTES:
+            # Освобождаем пятую часть — не гоняем VACUUM на каждую запись.
+            drop = max(1, count // 5)
+            self._conn.execute(
+                "DELETE FROM entries WHERE key IN "
+                "(SELECT key FROM entries ORDER BY updated_at LIMIT ?)",
+                (drop,),
+            )
+        self._conn.commit()
 
     # ------------------------------------------------------------------
     def put_link(self, key: str, url: str, headers: dict[str, str], size: int | None,

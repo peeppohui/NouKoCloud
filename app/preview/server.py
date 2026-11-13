@@ -446,6 +446,14 @@ class PreviewServer:
             if method not in ("GET", "HEAD"):
                 await self._send_status(writer, 405, "Метод не поддерживается")
                 return
+            # Защита от DNS-rebinding: сервер слушает loopback, но браузер
+            # может прислать запрос с чужим Host. Свой Host у плеера —
+            # 127.0.0.1 (с портом или без). Без этой проверки сторонний
+            # сайт теоретически мог бы достучаться до превью.
+            if not self._host_allowed(headers.get("host", "")):
+                log.warning("Превью: отклонён запрос с Host=%r", headers.get("host"))
+                await self._send_status(writer, 403, "Недопустимый Host")
+                return
             route, _, rest = path.lstrip("/").partition("/")
             token = rest.split("?", 1)[0]
             session = self._sessions.get(token)
@@ -481,6 +489,24 @@ class PreviewServer:
                 await asyncio.wait_for(writer.wait_closed(), timeout=1)
             except BaseException:
                 pass
+
+    @staticmethod
+    def _host_allowed(host: str) -> bool:
+        """Разрешены только имена самого loopback-интерфейса.
+
+        HTTP/1.0 может прийти без Host — такой запрос допускаем: его
+        невозможно инициировать из браузера с чужим доменом.
+        """
+        if not host:
+            return True
+        value = host.strip().lower()
+        if value.startswith("["):          # [::1]:1234
+            name = value.split("]", 1)[0] + "]"
+        elif value.count(":") == 1:
+            name = value.rsplit(":", 1)[0]  # 127.0.0.1:1234
+        else:
+            name = value
+        return name in ("127.0.0.1", "localhost", "[::1]")
 
     # ------------------------------------------------------------------
     async def _send_status(self, writer: asyncio.StreamWriter, status: int, text: str,

@@ -258,6 +258,8 @@ class QueueView(QWidget):
     cancel_requested = Signal(str)
     remove_requested = Signal(str)
     open_folder_requested = Signal()
+    retry_failed_requested = Signal()
+    csv_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -296,10 +298,18 @@ class QueueView(QWidget):
         buttons.setSpacing(8)
         self._btn_open = button("Открыть папку", "outline", self, icon_name="folder")
         self._btn_open.clicked.connect(self.open_folder_requested)
+        self._btn_retry = button("Повторить неудачные", "outline", self, icon_name="play")
+        self._btn_retry.setToolTip("Повторить все загрузки, которые закончились ошибкой")
+        self._btn_retry.clicked.connect(self.retry_failed_requested)
+        self._btn_csv = button("Отчёт CSV", "outline", self, icon_name="log")
+        self._btn_csv.setToolTip("Сохранить список загрузок в таблицу для Excel")
+        self._btn_csv.clicked.connect(self.csv_requested)
         self._btn_clear = button("Убрать готовые", "ghost", self)
         self._btn_clear.setToolTip("Убрать из списка скачанные, отменённые и неудачные файлы")
         self._btn_clear.clicked.connect(self._remove_finished)
         buttons.addWidget(self._btn_open)
+        buttons.addWidget(self._btn_retry)
+        buttons.addWidget(self._btn_csv)
         buttons.addWidget(self._btn_clear)
         buttons.addStretch(1)
         layout.addLayout(buttons)
@@ -342,6 +352,11 @@ class QueueView(QWidget):
             self.update_job(job, full=True)
         self._empty.setVisible(not self._cards)
         self._btn_clear.setEnabled(any(j.state in FINISHED for j in self._jobs.values()))
+        failed = sum(1 for j in self._jobs.values() if j.state is JobState.FAILED)
+        self._btn_retry.setText(
+            f"Повторить неудачные ({failed})" if failed else "Повторить неудачные")
+        self._btn_retry.setEnabled(bool(failed))
+        self._btn_csv.setEnabled(bool(self._jobs))
 
     def update_job(self, job: DownloadJob, full: bool = False) -> None:
         card = self._cards.get(job.job_id)

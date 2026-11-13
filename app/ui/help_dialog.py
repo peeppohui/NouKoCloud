@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Callable
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QTextBrowser, QWidget
 
 from ..core.paths import is_frozen
@@ -31,7 +33,9 @@ def guide_text() -> str:
 
 
 class HelpDialog(OverlayDialog):
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, parent: QWidget | None = None, *,
+                 on_diagnostics: Callable[[], None] | None = None,
+                 on_wizard: Callable[[], None] | None = None) -> None:
         super().__init__("как подключить аккаунты", parent, max_width=860)
         self.setWindowTitle("Как подключить аккаунты")
         self.view = QTextBrowser(self.body)
@@ -48,6 +52,25 @@ class HelpDialog(OverlayDialog):
             f"QTextBrowser {{ background: transparent; border: none; font-size: 14px; color: {palette.text}; }}")
         self.view.setMarkdown(guide_text())
         self.body_layout.addWidget(self.view, 1)
+        if on_diagnostics is not None:
+            diag = button("Собрать диагностику", "outline", self.card,
+                          icon_name="log", size="m")
+            diag.setToolTip("Архив с журналами и настройками для отправки разработчику")
+            diag.clicked.connect(on_diagnostics)
+            self.footer.addWidget(diag)
+        self._on_wizard = on_wizard
+        if on_wizard is not None:
+            wizard = button("Мастер настройки", "outline", self.card,
+                            icon_name="gear", size="m")
+            wizard.setToolTip("Пройти настройку заново: ключи, папка загрузок, автозапуск")
+            wizard.clicked.connect(self._open_wizard)
+            self.footer.addWidget(wizard)
         close = button("Понятно", "primary", self.card, size="m")
         close.clicked.connect(self.accept)
         self.footer.addWidget(close)
+
+    def _open_wizard(self) -> None:
+        """Открыть мастер настройки: сначала закрываем это окно."""
+        self.reject()
+        if self._on_wizard is not None:
+            QTimer.singleShot(0, self._on_wizard)

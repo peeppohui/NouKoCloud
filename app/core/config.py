@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import tempfile
 import time
 import uuid
@@ -81,6 +82,8 @@ class AppConfig:
     last_update_notified: str = ""
 
     # --- Служебное ---
+    #: Мастер первого запуска уже пройден (или пропущен) — показывать его больше не нужно.
+    first_run_completed: bool = False
     #: Версия настроек: по ней старые значения по умолчанию заменяются новыми.
     config_version: int = 0
     window_geometry: str = ""
@@ -143,7 +146,18 @@ class AppConfig:
             cfg._apply_file(portable)
         # 2. Свои настройки пользователя — имеют приоритет.
         if CONFIG_FILE.exists():
-            cfg._apply_file(CONFIG_FILE)
+            if not cfg._apply_file(CONFIG_FILE):
+                # Новый файл уже не читается; старый откладываем, чтобы
+                # пользователь мог прислать его в поддержку. Токены лежат
+                # в tokens.dat и этим не затрагиваются.
+                _set_aside_broken(CONFIG_FILE)
+                cfg._load_warning = (
+                    "Файл настроек повреждён — программа начала с настроек по умолчанию. "
+                    "Старый файл сохранён как config.broken.json; входы в аккаунты не затронуты."
+                )
+            elif cfg.config_version < CONFIG_VERSION:
+                # Перед перезаписью файла настройками новой версии оставляем копию.
+                _backup_config(CONFIG_FILE)
         _apply_env_overrides(cfg)
         cfg._config_path = CONFIG_FILE
         _repair_download_dir(cfg)
@@ -156,17 +170,22 @@ class AppConfig:
             cfg.device_id = uuid.uuid4().hex[:32]
         return cfg
 
-    def _apply_file(self, path: Path) -> None:
-        """Читает файл настроек. Пустые значения не затирают заданные."""
+    def _apply_file(self, path: Path) -> bool:
+        """Читает файл настроек. Пустые значения не затирают заданные.
+
+        False — файл не прочитался (битый JSON или не объект): вызывающий
+        решает, отложить его и начать с дефолтов.
+        """
         try:
             # utf-8-sig: build.ps1 (Windows PowerShell 5) пишет файл с BOM,
             # а обычный utf-8 на BOM падает — и «вшитые» ключи терялись.
             raw = json.loads(path.read_text(encoding="utf-8-sig"))
         except Exception as exc:
             log.warning("Не удалось прочитать настройки %s: %s", path, exc)
-            return
+            return False
         if not isinstance(raw, dict):
-            return
+            log.warning("Настройки %s — не объект JSON", path)
+            return False
         known = {f.name for f in fields(self)}
         for key, value in raw.items():
             if key not in known:
@@ -174,6 +193,7 @@ class AppConfig:
             if value is None or (isinstance(value, str) and not value.strip()):
                 continue
             setattr(self, key, value)
+        return True
 
 
 PREVIEW_CACHE_FOLDER = ".noukocloud-preview"
@@ -217,7 +237,29 @@ def _repair_download_dir(cfg: AppConfig) -> None:
         cfg.download_dir = default
 
 
-CONFIG_VERSION = 2
+CONFIG_VERSION = 3
+
+
+def _backup_config(path: Path) -> None:
+    """Копия настроек перед миграцией. Одна и та же — повторно не плодим."""
+    backup = path.with_name("config.v2.bak")
+    if backup.exists():
+        return
+    try:
+        shutil.copy2(path, backup)
+        log.info("Копия настроек перед миграцией: %s", backup)
+    except OSError as exc:
+        log.warning("Не удалось сохранить копию настроек %s: %s", backup, exc)
+
+
+def _set_aside_broken(path: Path) -> None:
+    """Откладывает нечитаемый config.json, чтобы не потерять его безвозвратно."""
+    broken = path.with_name("config.broken.json")
+    try:
+        path.replace(broken)
+        log.warning("Повреждённые настройки отложены: %s", broken)
+    except OSError as exc:
+        log.warning("Не удалось отложить повреждённые настройки %s: %s", path, exc)
 
 
 def _upgrade_defaults(cfg: AppConfig) -> None:
@@ -230,10 +272,13 @@ def _upgrade_defaults(cfg: AppConfig) -> None:
     """
     if cfg.config_version >= CONFIG_VERSION:
         return
-    if cfg.max_parallel_segments == 4:
-        cfg.max_parallel_segments = 12
-    if cfg.segment_min_mb == 64:
-        cfg.segment_min_mb = 4
+    # Значения частей менялись только в версии 2. После неё «4 части» и
+    # «64 МБ» — это уже выбор пользователя, и трогать его нельзя.
+    if cfg.config_version < 2:
+        if cfg.max_parallel_segments == 4:
+            cfg.max_parallel_segments = 12
+        if cfg.segment_min_mb == 64:
+            cfg.segment_min_mb = 4
     cfg.config_version = CONFIG_VERSION
 
 
@@ -251,6 +296,41 @@ def _apply_env_overrides(cfg: AppConfig) -> None:
         value = os.environ.get(env_name) or os.environ.get(env_name.replace("NOUKOCLOUD_", "SVSCLOUD_"))
         if value:
             setattr(cfg, attr, value)
+
+
+def manual_keys_present() -> bool:
+    """Ключи OAuth заданы в файле настроек пользователя (не в portable).
+
+    Portable-конфиг и переменные окружения — это дефолты сборки, их нельзя
+    считать ручной настройкой пользователя.
+    """
+    if not CONFIG_FILE.exists():
+        return False
+    try:
+        raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return False
+    if not isinstance(raw, dict):
+        return False
+    for key in ("yandex_client_id", "google_client_id"):
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
+def should_show_wizard(cfg: AppConfig) -> bool:
+    """Показывать ли мастер первого запуска.
+
+    Мастер нужен новому пользователю: файла настроек ещё нет. Если мастер уже
+    пройден — не показываем. Если пользователь сам настроил ключи вручную,
+    мастер тоже не нужен: настройка уже сделана.
+    """
+    if getattr(cfg, "first_run_completed", False):
+        return False
+    if not CONFIG_FILE.exists():
+        return True
+    return not manual_keys_present()
 
 
 def ensure_oauth_configured(cfg: AppConfig) -> list[str]:

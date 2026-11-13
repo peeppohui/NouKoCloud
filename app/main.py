@@ -9,7 +9,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QApplication
 
 from .context import build_context
-from .core.config import AppConfig
+from .core.config import AppConfig, should_show_wizard
 from .core.logging_setup import install_qt_message_handler, level_from_name, setup_logging
 from .core.autostart import BACKGROUND_ARG
 from .core.paths import APP_TITLE
@@ -87,6 +87,14 @@ def main(argv: list[str] | None = None) -> int:
         window.show()
     if start_url:
         window.open_link_at_startup(start_url)
+    if not background and should_show_wizard(config):
+        # Первый запуск: короткая настройка (ключи, папка загрузок).
+        log.info("Показываем мастер первого запуска")
+        QTimer.singleShot(600, window.show_setup_wizard)
+    warning = getattr(config, "_load_warning", "")
+    if warning:
+        log.warning(warning)
+        QTimer.singleShot(1200, lambda: window._on_notice("warn", warning))
 
     # Автозапуск в фоне не должен неожиданно открывать браузер.
     if not background and config.update_check_on_start:

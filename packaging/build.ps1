@@ -8,10 +8,16 @@
 
     Ключи OAuth кладутся в config.json рядом с exe: монтажёрам не нужно
     ничего вводить — достаточно нажать «Аккаунты» → «Войти».
+
+    ВАЖНО: config.json с настоящими ключами попадает в публичный архив,
+    и ключи сможет забрать кто угодно. Для публичных релизов собирайте
+    без ключей (-NoPortableKeys) — пользователь введёт их в мастере
+    настройки или в «Настройках».
 #>
 param(
     [switch]$OneFile,
     [switch]$SkipFfmpeg,
+    [switch]$NoPortableKeys,
     [string]$YandexClientId = "",
     [string]$YandexClientSecret = "",
     [string]$GoogleClientId = "",
@@ -86,13 +92,28 @@ $portable = [ordered]@{
     google_client_secret = $GoogleClientSecret
     google_api_key        = $GoogleApiKey
 }
-$portable | ConvertTo-Json | Out-File -Encoding utf8 (Join-Path $target "config.json")
 $filled = ($portable.Values | Where-Object { $_ -and $_.Trim() }).Count
-if ($filled -eq $portable.Values.Count) {
-    Write-Host "    Ключи OAuth записаны в config.json рядом с программой" -ForegroundColor Green
+if ($NoPortableKeys) {
+    # Публичная сборка: настоящих ключей в архиве быть не должно.
+    $portablePath = Join-Path $target "config.json"
+    if (Test-Path $portablePath) { Remove-Item $portablePath -Force }
+    Write-Host "    Ключи OAuth не кладутся в сборку (-NoPortableKeys)" -ForegroundColor Green
+} elseif ($filled -eq 0) {
+    Write-Host "    Ключи OAuth не заданы — пользователь введёт их в мастере настройки" -ForegroundColor Yellow
 } else {
-    Write-Host "    Записаны не все ключи OAuth ($filled из $($portable.Values.Count))" -ForegroundColor Yellow
-    Write-Host "    Пользователю придётся ввести недостающие в «Настройках»" -ForegroundColor Yellow
+    $portable | ConvertTo-Json | Out-File -Encoding utf8 (Join-Path $target "config.json")
+    if ($filled -eq $portable.Values.Count) {
+        Write-Host "    Ключи OAuth записаны в config.json рядом с программой" -ForegroundColor Green
+    } else {
+        Write-Host "    Записаны не все ключи OAuth ($filled из $($portable.Values.Count))" -ForegroundColor Yellow
+        Write-Host "    Пользователю придётся ввести недостающие в «Настройках»" -ForegroundColor Yellow
+    }
+}
+
+# --- Уведомления о сторонних программах ---
+$notices = Join-Path $Root "THIRD_PARTY_NOTICES.md"
+if (Test-Path $notices) {
+    Copy-Item -Force $notices (Join-Path $target "THIRD_PARTY_NOTICES.md")
 }
 
 Write-Host "`nГотово: $target\NoukoCloud.exe" -ForegroundColor Green
