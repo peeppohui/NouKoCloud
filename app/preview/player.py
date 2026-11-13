@@ -16,7 +16,7 @@ import os
 import time
 
 from PySide6.QtCore import (
-    QBuffer, QByteArray, QEvent, QIODevice, QPointF, QSize, Qt, QTimer, QUrl, Signal,
+    QBuffer, QByteArray, QEvent, QIODevice, QObject, QPointF, QSize, Qt, QTimer, QUrl, Signal,
 )
 from PySide6.QtGui import (
     QColor, QCursor, QIcon, QImage, QImageReader, QPainter, QPainterPath, QPen, QPixmap,
@@ -51,6 +51,11 @@ except Exception as exc:  # pragma: no cover - сборка без QtMultimedia
 
 SEEK_STEP_MS = 5000
 FINE_STEP_MS = 1000            # Shift + стрелка
+#: Во весь экран: панель и курсор прячутся, если мышь не двигалась столько мс.
+FS_IDLE_MS = 2500
+#: Клавиша F (код клавиши Windows) — в любой раскладке (в русской это «А»).
+VK_F = 0x46
+QWIDGETSIZE_MAX = 16777215
 #: Звук отдельной дорожкой (YouTube). Звук — главные часы, его не трогаем
 #: (каждая перемотка звука — пауза в звуке). Видео догоняет его скоростью:
 #: расхождение больше AV_DRIFT_MS — скорость видео ±до AV_MAX_RATE_SHIFT;
@@ -71,8 +76,6 @@ SLOW_LINK_HORIZON_S = 10.0
 OFFER_NO_WAIT_S = 3.0
 BUFFER_CHECK_MS = 200
 # Полный экран: через сколько секунд бездействия мыши прячем панель и курсор.
-FULLSCREEN_IDLE_S = 2.5
-FULLSCREEN_TICK_MS = 200
 IMAGE_MAX_SIDE = 4096          # крупнее не нужно для превью, а память экономим
 IMAGE_ALLOCATION_LIMIT_MB = 1024
 
@@ -245,87 +248,6 @@ def _is_letter_key(event, key: Qt.Key, virtual_key: int) -> bool:
     return event.key() == key or event.nativeVirtualKey() == virtual_key
 
 
-def _fullscreen_icon(color: QColor, exit_mode: bool = False, size: int = 20) -> QIcon:
-    """Значок «на весь экран» (уголки наружу) или «выйти» (уголки внутрь)."""
-    ratio = 2
-    pixmap = QPixmap(size * ratio, size * ratio)
-    pixmap.setDevicePixelRatio(ratio)
-    pixmap.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    pen = QPen(color)
-    pen.setWidthF(1.8)
-    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-    painter.setPen(pen)
-    low, high, arm = size * 0.2, size * 0.8, size * 0.26
-    for cx, cy in ((low, low), (high, low), (high, high), (low, high)):
-        dx = 1 if cx == low else -1      # куда смотрит «внутрь» по горизонтали
-        dy = 1 if cy == low else -1
-        end_a = QPointF(cx + dx * arm, cy)
-        end_b = QPointF(cx, cy + dy * arm)
-        vertex = QPointF(cx + dx * arm, cy + dy * arm) if exit_mode else QPointF(cx, cy)
-        path = QPainterPath(end_a)
-        path.lineTo(vertex)
-        path.lineTo(end_b)
-        painter.drawPath(path)
-    painter.end()
-    return QIcon(pixmap)
-
-
-class FullscreenWindow(QWidget):
-    """Окно «на весь экран».
-
-    Видео и панель управления переезжают сюда из PreviewPlayer на время
-    просмотра (см. PreviewPlayer.enter_fullscreen). Свои клавиши у окна
-    только Esc и F — выход; остальные уходят плееру, поэтому пробел,
-    стрелки, I и O работают как в обычном окне.
-    """
-
-    leave_requested = Signal()
-    activity = Signal()
-
-    def __init__(self, owner: QWidget) -> None:
-        super().__init__(None, Qt.WindowType.Window)
-        self._owner = owner
-        self.setWindowTitle("НоуКо Cloud — превью")
-        self.setWindowIcon(owner.window().windowIcon())
-        self.setObjectName("fullscreenStage")
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setStyleSheet("#fullscreenStage { background: #000000; }")
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-
-        self.box = QVBoxLayout(self)
-        self.box.setContentsMargins(0, 0, 0, 0)
-        self.box.setSpacing(0)
-
-        # Нижняя панель: тёмная, чтобы значки читались и в светлой теме.
-        self.bar = QFrame(self)
-        self.bar.setObjectName("fullscreenBar")
-        self.bar.setStyleSheet(
-            "#fullscreenBar { background: rgba(14, 14, 18, 235); }"
-            "#fullscreenBar QLabel { color: #f2f2f2; }"
-        )
-        self.bar_layout = QHBoxLayout(self.bar)
-        self.bar_layout.setContentsMargins(20, 8, 20, 12)
-        self.bar_layout.setSpacing(0)
-
-    def keyPressEvent(self, event) -> None:  # noqa: N802
-        if event.key() == Qt.Key.Key_Escape or _is_letter_key(event, Qt.Key.Key_F, 0x46):
-            event.accept()
-            self.leave_requested.emit()
-            return
-        self.activity.emit()
-        # Остальное — плееру: он обработает или отдаст выше по цепочке.
-        QApplication.sendEvent(self._owner, event)
-        event.accept()
-
-    def closeEvent(self, event) -> None:  # noqa: N802
-        # Alt+F4 и подобное: не закрываем окно, а возвращаем видео на место.
-        event.ignore()
-        self.leave_requested.emit()
-
-
 class ImageView(QLabel):
     """Изображение, вписанное в область с сохранением пропорций."""
 
@@ -361,6 +283,53 @@ class ImageView(QLabel):
             ))
 
 
+class _DoubleClick(QObject):
+    """Двойной щелчок по видео или картинке — во весь экран и обратно."""
+
+    def __init__(self, player: "PreviewPlayer") -> None:
+        super().__init__(player)
+        self._player = player
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if event.type() == QEvent.Type.MouseButtonDblClick and event.button() == Qt.MouseButton.LeftButton:
+            self._player._on_double_click()
+            return True
+        return False
+
+
+class _FullscreenHost(QWidget):
+    """Окно на весь экран, куда на время переезжает плеер (с панелью управления).
+
+    Принадлежит главному окну: сворачивается и закрывается вместе с ним.
+    Следит за мышью во всём приложении, пока открыто: движение — показать
+    панель; главное окно спрятали (в трей) — вернуть плеер на место.
+    """
+
+    def __init__(self, player: "PreviewPlayer", owner: QWidget | None) -> None:
+        super().__init__(owner, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
+        self._player = player
+        self._owner = owner
+        self.setObjectName("fullscreenHost")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet("QWidget#fullscreenHost { background: #000; }")
+        self.setWindowTitle("Превью")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 16, 24, 16)
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        kind = event.type()
+        if kind == QEvent.Type.MouseMove:
+            self._player._fs_activity()
+        elif kind == QEvent.Type.Hide and obj is self._owner:
+            QTimer.singleShot(0, self._player.exit_fullscreen)
+        return False
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        # Alt+F4 во весь экран — просто вернуться в обычный размер.
+        event.ignore()
+        QTimer.singleShot(0, self._player.exit_fullscreen)
+
+
 class PreviewPlayer(QWidget):
     """Плеер превью. Работает только в GUI-потоке."""
 
@@ -383,6 +352,13 @@ class PreviewPlayer(QWidget):
         self._no_wait = False       # пользователь выбрал «смотреть сразу, без буфера»
         self._first_frame = False   # первый кадр уже на экране
         self._aplayer = None        # звук отдельной дорожкой (у YouTube видео и звук раздельно)
+        self._fs_host: _FullscreenHost | None = None   # окно «во весь экран», пока оно открыто
+        self._fs_restore = None     # (родитель, его раскладка, заглушка, мин. и макс. размер)
+        self._fs_switching = False  # плеер переезжает между окнами — это не «скрыли вкладку»
+        self._fs_idle = QTimer(self)
+        self._fs_idle.setSingleShot(True)
+        self._fs_idle.setInterval(FS_IDLE_MS)
+        self._fs_idle.timeout.connect(self._fs_hide_controls)
         self._stop_at: int | None = None   # «проиграть фрагмент»: пауза на этой позиции
         # Таймкод и работа по кадрам (ТЗ 4.9).
         self._fps = 0.0                    # частота кадров; 0 — неизвестна
@@ -399,15 +375,6 @@ class PreviewPlayer(QWidget):
         self._buffer_timer = QTimer(self)
         self._buffer_timer.setInterval(BUFFER_CHECK_MS)
         self._buffer_timer.timeout.connect(self._check_buffer)
-
-        # Полный экран (см. enter_fullscreen).
-        self._fs: FullscreenWindow | None = None
-        self._fs_saved_message = ""
-        self._fs_last_pos = None
-        self._fs_idle_since = 0.0
-        self._fs_timer = QTimer(self)
-        self._fs_timer.setInterval(FULLSCREEN_TICK_MS)
-        self._fs_timer.timeout.connect(self._fs_tick)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -431,7 +398,9 @@ class PreviewPlayer(QWidget):
         self._audio_page.setWordWrap(True)
         self._stack.addWidget(self._audio_page)
 
+        self._double_click = _DoubleClick(self)
         self._image = ImageView(self._stack)
+        self._image.installEventFilter(self._double_click)
         self._stack.addWidget(self._image)
 
         self._video = None
@@ -442,8 +411,8 @@ class PreviewPlayer(QWidget):
             _ensure_localhost_bypasses_proxy()
             QImageReader.setAllocationLimit(IMAGE_ALLOCATION_LIMIT_MB)
             self._video = QVideoWidget(self._stack)
+            self._video.installEventFilter(self._double_click)
             self._video.setAspectRatioMode(Qt.AspectRatioMode.KeepAspectRatio)
-            self._video.installEventFilter(self)   # двойной клик — на весь экран
             self._stack.addWidget(self._video)
 
             self._player = QMediaPlayer(self)
@@ -520,16 +489,15 @@ class PreviewPlayer(QWidget):
         self._volume.setToolTip("Громкость")
         self._volume.valueChanged.connect(self._on_volume)
         row.addWidget(self._volume)
-
-        self._btn_full = QToolButton(self._controls)
-        self._btn_full.setProperty("kind", "icon")
-        self._btn_full.setAccessibleName("На весь экран")
-        self._btn_full.setFixedSize(40, 40)
-        self._btn_full.setIconSize(QSize(20, 20))
-        self._btn_full.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._btn_full.clicked.connect(self.toggle_fullscreen)
-        self._btn_full.setVisible(False)       # только для видео
-        row.addWidget(self._btn_full)
+        self._btn_fullscreen = QToolButton(self._controls)
+        self._btn_fullscreen.setProperty("kind", "icon")
+        self._btn_fullscreen.setToolTip("Во весь экран (F, двойной щелчок по видео) · выход — Esc")
+        self._btn_fullscreen.setAccessibleName("Во весь экран")
+        self._btn_fullscreen.setFixedSize(40, 40)
+        self._btn_fullscreen.setIconSize(QSize(20, 20))
+        self._btn_fullscreen.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_fullscreen.clicked.connect(self.toggle_fullscreen)
+        row.addWidget(self._btn_fullscreen)
         layout.addWidget(self._controls)
 
         # --- Кадры, отметки in/out, экспорт кадра (только для видео) -----
@@ -586,7 +554,7 @@ class PreviewPlayer(QWidget):
         layout.addWidget(self._frame_row)
         # Клавиши (пробел, стрелки) обрабатывает сам плеер: ползунок с фокусом
         # перехватил бы стрелки и сдвигал бы позицию на 1 мс без перемотки.
-        for control in (self._btn_play, self._slider, self._btn_mute, self._volume, self._btn_full):
+        for control in (self._btn_play, self._slider, self._btn_mute, self._volume, self._btn_fullscreen):
             control.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         for control in (self._btn_frame_back, self._btn_frame_fwd, self._btn_mark_in,
                         self._btn_mark_out, self._btn_play_range, self._btn_clear_marks,
@@ -663,7 +631,7 @@ class PreviewPlayer(QWidget):
         else:
             self._show_page(self._video)
         self._controls.setVisible(True)
-        self._btn_full.setVisible(kind == "video")
+        self._sync_fullscreen_button()
         # Покадровые кнопки и таймкод — только для видео (ТЗ 4.9).
         self._frame_row.setVisible(kind == "video")
         self._timecode.setVisible(kind == "video")
@@ -704,6 +672,7 @@ class PreviewPlayer(QWidget):
             self.show_message("Превью изображений недоступно в этой сборке.")
             return
         self._kind = "image"
+        self._sync_fullscreen_button()
         self._url = url
         self._image.clear_image()
         self._show_page(self._image)
@@ -756,7 +725,7 @@ class PreviewPlayer(QWidget):
         self._out_ms = None
         self._speed_index = 0
         self._controls.setVisible(False)
-        self._btn_full.setVisible(False)
+        self._sync_fullscreen_button()
 
     def clear(self) -> None:
         self.show_message(PLACEHOLDER)
@@ -789,129 +758,6 @@ class PreviewPlayer(QWidget):
     @property
     def buffering(self) -> bool:
         return self._buffering
-
-    # --- полный экран ---------------------------------------------------
-    @property
-    def is_fullscreen(self) -> bool:
-        return self._fs is not None
-
-    def toggle_fullscreen(self) -> None:
-        if self._fs is not None:
-            self.exit_fullscreen()
-        else:
-            self.enter_fullscreen()
-
-    def enter_fullscreen(self) -> None:
-        """Видео — на весь экран, панель управления едет вместе с ним.
-
-        Плеер и QVideoWidget те же самые — их только переносим в другое
-        окно, поэтому воспроизведение, звук, буферизация и отметки I/O
-        идут без перезапуска.
-        """
-        if self._fs is not None or self._video is None or self._kind != "video":
-            return
-        window = FullscreenWindow(self)
-        window.leave_requested.connect(self.exit_fullscreen)
-        window.activity.connect(self._fs_wake)
-
-        # В обычном окне на время остаётся заглушка.
-        self._fs_saved_message = self._message.text()
-        self._message.setText("Видео открыто на весь экран.\nEsc или F — вернуться.")
-        self._stack.removeWidget(self._video)
-        self._show_page(self._message)
-        self._layout.removeWidget(self._controls)
-        window.box.addWidget(self._video, 1)
-        window.bar_layout.addWidget(self._controls)
-        window.box.addWidget(window.bar)
-        self._video.show()
-        self._controls.show()
-
-        self._fs = window
-        screen = self.screen()
-        if screen is not None:
-            window.setGeometry(screen.geometry())   # на том экране, где окно программы
-        window.showFullScreen()
-        window.activateWindow()
-        window.setFocus()
-        self._fs_last_pos = QCursor.pos()
-        self._fs_idle_since = time.monotonic()
-        self._fs_timer.start()
-        self._sync_fullscreen_button()
-        self._sync_mute_button()
-
-    def exit_fullscreen(self, activate: bool = True) -> None:
-        """Вернуть видео и панель в окно программы. activate=False — окно
-        программы само прячется (в трей/свёрнуто), активировать его не нужно."""
-        window, self._fs = self._fs, None
-        if window is None:
-            return
-        self._fs_timer.stop()
-        window.bar_layout.removeWidget(self._controls)
-        window.box.removeWidget(self._video)
-        self._layout.insertWidget(self._layout.indexOf(self._stack) + 1, self._controls)
-        self._stack.addWidget(self._video)
-        self._stack.setCurrentWidget(self._video)
-        self._message.setText(self._fs_saved_message)
-        self._video.show()
-        self._controls.show()
-        window.hide()
-        window.deleteLater()
-        self._sync_fullscreen_button()
-        self._sync_mute_button()
-        if activate:
-            self.window().activateWindow()
-            self.setFocus()
-
-    def _fs_wake(self) -> None:
-        """Показать панель и курсор (мышь двинули или нажали клавишу)."""
-        window = self._fs
-        if window is None:
-            return
-        self._fs_idle_since = time.monotonic()
-        if not window.bar.isVisible():
-            window.bar.show()
-        window.unsetCursor()
-
-    def _fs_tick(self) -> None:
-        """Панель и курсор прячутся, когда мышь неподвижна, а видео играет."""
-        window = self._fs
-        if window is None:
-            return
-        pos = QCursor.pos()
-        moved = pos != self._fs_last_pos
-        self._fs_last_pos = pos
-        bar_visible = window.bar.isVisible()
-        over_bar = bar_visible and window.bar.geometry().contains(window.mapFromGlobal(pos))
-        playing = self._want_play or self._is_playing()
-        if moved or over_bar or self._slider.isSliderDown() or not playing:
-            self._fs_wake()
-        elif bar_visible and time.monotonic() - self._fs_idle_since >= FULLSCREEN_IDLE_S:
-            window.bar.hide()
-            window.setCursor(Qt.CursorShape.BlankCursor)
-
-    def _sync_fullscreen_button(self) -> None:
-        active = self._fs is not None
-        if active:
-            color = QColor("#f2f2f2")
-        else:
-            try:
-                from ..ui import theme as _theme
-
-                color = QColor(_theme.current().text)
-            except Exception:  # pragma: no cover
-                color = QColor("#ffffff")
-        self._btn_full.setIcon(_fullscreen_icon(color, exit_mode=active))
-        self._btn_full.setToolTip(
-            "Выйти из полного экрана (Esc или F)" if active
-            else "На весь экран (F или двойной клик по видео)"
-        )
-
-    def eventFilter(self, obj, event) -> bool:  # noqa: N802
-        if obj is self._video and event.type() == QEvent.Type.MouseButtonDblClick:
-            # Откладываем: видео переезжает в другое окно, а мы внутри его же события.
-            QTimer.singleShot(0, self.toggle_fullscreen)
-            return True   # встроенный полноэкранный режим QVideoWidget не нужен
-        return super().eventFilter(obj, event)
 
     # --- позиция и фрагменты (вкладка «Соцсети») ------------------------
     def position_ms(self) -> int:
@@ -1378,7 +1224,7 @@ class PreviewPlayer(QWidget):
 
         muted = self._audio is None or self._audio.isMuted() or self._volume.value() == 0
         name = "mute" if muted else "volume"
-        if self._fs is not None:   # панель тёмная — значок светлый
+        if self._fs_host is not None:   # панель тёмная — значок светлый
             try:
                 self._btn_mute.setIcon(_theme.icon(name, "#f2f2f2", 20))
                 return
@@ -1408,15 +1254,19 @@ class PreviewPlayer(QWidget):
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
         key = event.key()
-        if key == Qt.Key.Key_Space:
+        no_mods = not (event.modifiers() & (Qt.KeyboardModifier.ControlModifier
+                                            | Qt.KeyboardModifier.AltModifier))
+        if key == Qt.Key.Key_Escape and self._fs_host is not None:
+            self.exit_fullscreen()
+        elif no_mods and (key in (Qt.Key.Key_F, Qt.Key.Key_F11) or event.nativeVirtualKey() == VK_F):
+            self.toggle_fullscreen()
+        elif key == Qt.Key.Key_Space:
             self.toggle_play()
         elif key in (Qt.Key.Key_Left, Qt.Key.Key_Right) and self._player is not None:
             size = FINE_STEP_MS if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else SEEK_STEP_MS
             step = size if key == Qt.Key.Key_Right else -size
             target = max(0, min(self._player.duration(), self._player.position() + step))
             self._seek(target)
-        elif self._kind == "video" and _is_letter_key(event, Qt.Key.Key_F, 0x46):
-            self.toggle_fullscreen()
         elif self._kind == "video" and key == Qt.Key.Key_Comma:
             self.step_frame(-1)
         elif self._kind == "video" and key == Qt.Key.Key_Period:
@@ -1442,9 +1292,139 @@ class PreviewPlayer(QWidget):
 
     def hideEvent(self, event) -> None:  # noqa: N802
         # Ушли на вкладку «Очередь» или свернули окно — звук не должен играть «в фоне».
-        self.exit_fullscreen(activate=False)
-        self.pause()
+        # Переезд во весь экран и обратно — не повод ставить паузу.
+        if not self._fs_switching:
+            self.pause()
         super().hideEvent(event)
+
+    # ------------------------------------------------------------------
+    # Во весь экран
+    # ------------------------------------------------------------------
+    def is_fullscreen(self) -> bool:
+        return self._fs_host is not None
+
+    def toggle_fullscreen(self) -> None:
+        if self._fs_host is not None:
+            self.exit_fullscreen()
+        else:
+            self.enter_fullscreen()
+
+    def can_fullscreen(self) -> bool:
+        return self._kind in ("video", "image")
+
+    def enter_fullscreen(self) -> None:
+        """Плеер на время переезжает в окно на весь экран (того монитора, где программа)."""
+        parent = self.parentWidget()
+        layout = parent.layout() if parent is not None else None
+        if self._fs_host is not None or not self.can_fullscreen() or layout is None:
+            return
+        owner = self.window()
+        screen = owner.screen() if owner is not None else None
+        self._fs_switching = True
+        try:
+            # Заглушка держит место плеера, чтобы страница под ним не прыгала.
+            holder = QWidget(parent)
+            holder.setFixedHeight(self.height())
+            holder.setSizePolicy(self.sizePolicy())
+            layout.replaceWidget(self, holder)
+            self._fs_restore = (parent, layout, holder, self.minimumSize(), self.maximumSize())
+            self.setMinimumSize(0, 0)
+            self.setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX)
+            host = _FullscreenHost(self, owner)
+            host.layout().addWidget(self)
+            if screen is not None:
+                host.setGeometry(screen.geometry())
+            self._fs_host = host
+            # Во весь экран — чисто чёрная сцена без рамки, как в обычных плеерах.
+            self._stack.setStyleSheet("QStackedWidget#stage { background: #000; border: none; border-radius: 0; }")
+            host.showFullScreen()
+            self.show()
+            host.activateWindow()
+            self.setFocus()
+        finally:
+            self._fs_switching = False
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self._fs_host)
+        self._sync_fullscreen_button()
+        self._fs_activity()
+        log.info("Превью: во весь экран")
+
+    def exit_fullscreen(self) -> None:
+        host, restore = self._fs_host, self._fs_restore
+        if host is None or restore is None:
+            return
+        parent, layout, holder, min_size, max_size = restore
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(host)
+        self._fs_idle.stop()
+        self._fs_switching = True
+        try:
+            self._fs_host = None
+            self._fs_restore = None
+            host.layout().removeWidget(self)
+            self._stack.setStyleSheet("")
+            layout.replaceWidget(holder, self)
+            holder.hide()
+            holder.deleteLater()
+            self.setMinimumSize(min_size)
+            self.setMaximumSize(max_size)
+            self._fs_show_controls()
+            self.show()
+            host.hide()
+            host.deleteLater()
+            owner = self.window()
+            if owner is not None:
+                owner.activateWindow()
+            self.setFocus()
+        finally:
+            self._fs_switching = False
+        self._sync_fullscreen_button()
+        log.info("Превью: обычный размер")
+
+    def set_embedded_height(self, height: int) -> None:
+        """Высота плеера на странице; во весь экран — запоминается до возврата."""
+        if self._fs_restore is not None:
+            parent, layout, holder, _min, _max = self._fs_restore
+            holder.setFixedHeight(height)
+            self._fs_restore = (parent, layout, holder, QSize(_min.width(), height), QSize(_max.width(), height))
+        else:
+            self.setFixedHeight(height)
+
+    def _sync_fullscreen_button(self) -> None:
+        from ..ui import theme as _theme
+
+        self._btn_fullscreen.setVisible(self.can_fullscreen() or self._fs_host is not None)
+        full = self._fs_host is not None
+        self._btn_fullscreen.setIcon(_theme.icon("fullscreen_exit" if full else "fullscreen", None, 20))
+        self._btn_fullscreen.setToolTip("Обычный размер (Esc)" if full else
+                                        "Во весь экран (F, двойной щелчок по видео) · выход — Esc")
+
+    def _fs_activity(self) -> None:
+        """Мышь шевельнулась во весь экран: показать панель и курсор, потом снова спрятать."""
+        if self._fs_host is None:
+            return
+        self._fs_show_controls()
+        self._fs_idle.start()
+
+    def _fs_show_controls(self) -> None:
+        self._controls.setVisible(self._kind in ("video", "audio"))
+        self._status.setVisible(True)
+        if self._fs_host is not None:
+            self._fs_host.unsetCursor()
+
+    def _fs_hide_controls(self) -> None:
+        # Панель не прячем, пока на ней мышь или видео на паузе.
+        if self._fs_host is None or self._controls.underMouse() or not self._is_playing():
+            return
+        self._controls.setVisible(False)
+        self._status.setVisible(False)
+        self._fs_host.setCursor(Qt.CursorShape.BlankCursor)
+
+    def _on_double_click(self) -> None:
+        if self.can_fullscreen() or self._fs_host is not None:
+            self.toggle_fullscreen()
 
 
 def _buffer_text(ahead_s: float, need_s: float, media_rate: float, rate: float) -> str:
