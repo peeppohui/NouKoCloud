@@ -1,6 +1,6 @@
-; Установщик НоуКо Cloud (per-user, без подписи).
+﻿; Установщик НоуКо Cloud (per-user, без подписи).
 ;
-; Сборка:  powershell -File packaging\build_installer.ps1 -Version 1.0.0
+; Сборка:  powershell -File packaging\build_installer.ps1 -Version 1.1.0
 ;
 ; Подписи у установщика нет: Windows SmartScreen покажет предупреждение
 ; «Неизвестный издатель» — так и задумано для 1.0 (решение владельца
@@ -18,7 +18,7 @@
 #define MyAppExeName "NoukoCloud.exe"
 
 #ifndef MyAppVersion
-  #define MyAppVersion "1.0.0"
+  #define MyAppVersion "1.1.0"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\dist\NoukoCloud"

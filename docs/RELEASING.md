@@ -81,15 +81,15 @@ python -m unittest discover -s tests -t . -v
 
 ```powershell
 git add .
-git commit -m "НоуКо Cloud 1.0.0"
-git tag -a v1.0.0 -m "1.0.0"
+git commit -m "НоуКо Cloud 1.1.0"
+git tag -a v1.1.0 -m "1.1.0"
 git push origin main --tags
 ```
 
 ### Шаг 3. Собрать и опубликовать
 
 ```powershell
-packaging\release.ps1 -Version 1.0.0
+packaging\release.ps1 -Version 1.1.0
 ```
 
 Скрипт делает всё по порядку:
@@ -115,8 +115,8 @@ packaging\release.ps1 -Version 1.0.0
 Соберите заново **без** ключей (по умолчанию они и не вставляются):
 
 ```powershell
-packaging\release.ps1 -Version 1.0.0          # публичный релиз, без ключей
-packaging\release.ps1 -Version 1.0.0 -WithKeys # приватная раздача (осторожно!)
+packaging\release.ps1 -Version 1.1.0          # публичный релиз, без ключей
+packaging\release.ps1 -Version 1.1.0 -WithKeys # приватная раздача (осторожно!)
 ```
 
 `-WithKeys` вставляет `config.json` с ключами рядом с exe — такой архив
@@ -187,4 +187,4 @@ helper-процесс обновления; для каждого — метка
 
 Релиз на GitHub можно удалить (Releases → Delete) — постоянная ссылка
 `releases/latest/download/...` продолжит отдавать предыдущую версию.
-Тег можно удалить: `git tag -d v1.0.0 && git push origin --delete v1.0.0`.
+Тег можно удалить: `git tag -d v1.1.0 && git push origin --delete v1.1.0`.

@@ -10,7 +10,7 @@
 
 Токен берётся из системного хранилища git (Git Credential Manager).
 
-    python tools/publish_release.py --version 1.0.0
+    python tools/publish_release.py --version 1.1.0
 """
 
 from __future__ import annotations
@@ -107,10 +107,16 @@ Windows 10/11 x64. Python не нужен.
 """
 
 #: Что изменилось в текущем релизе — попадает в описание на GitHub.
-CHANGES = """Это первый большой релиз: в нём закрыты все пункты P0 из ТЗ на 1.0.
+CHANGES = """Версия 1.1.0 — в ней закрыты все пункты P0 из ТЗ на 1.0: то, что в 1.0.0
+ещё было в планах, теперь работает.
 
 ### Нового
 
+* **Установщик для Windows.** Появился `NoukoCloud-Setup-1.1.0.exe`: ставится
+  без прав администратора в `%LOCALAPPDATA%\\Programs\\NoukoCloud`, ярлык
+  появляется в «Пуск». Portable-архив тоже остался — кому удобнее без
+  установки. Сборка не подписана: Windows покажет «Неизвестный издатель»,
+  нажмите «Подробнее» → «Выполнить в любом случае».
 * **Мастер первого запуска.** При первом старте программа сама предлагает
   настроить ключи, папку загрузок и автозапуск. Пропустить можно — программа
   работает и с публичными ссылками. Повторно мастер открывается через
@@ -191,7 +197,7 @@ def upload_asset(client, release_id: int, path: Path, name: str | None = None) -
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Публикация релиза НоуКо Cloud")
-    parser.add_argument("--version", required=True, help="версия, например 1.0.0")
+    parser.add_argument("--version", required=True, help="версия, например 1.1.0")
     parser.add_argument("--draft", action="store_true")
     parser.add_argument("--allow-secrets", action="store_true",
                         help="разрешить архив с настоящими ключами OAuth (по умолнию — нет)")

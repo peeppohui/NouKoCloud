@@ -55,7 +55,7 @@ powershell packaging\build.ps1 `
 ### Релиз
 
 ```powershell
-powershell packaging\release.ps1 -Version 1.0.0
+powershell packaging\release.ps1 -Version 1.1.0
 ```
 
 Скрипт собирает portable-архив, проверяет, что внутри нет настоящих ключей,

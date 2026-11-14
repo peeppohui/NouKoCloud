@@ -1,7 +1,7 @@
-<#
+﻿<#
     Сборка установщика НоуКо Cloud (Inno Setup, без подписи).
 
-    .\packaging\build_installer.ps1 -Version 1.0.0
+    .\packaging\build_installer.ps1 -Version 1.1.0
 
     Нужна собранная программа в dist\NoukoCloud (собирается сама, если её
     нет). ISCC.exe ищется в PATH и в обычных местах установки Inno Setup.
@@ -68,4 +68,4 @@ $setup = Join-Path $outDir "NoukoCloud-Setup-$Version.exe"
 if (-not (Test-Path $setup)) { throw "Установщик не найден: $setup" }
 $mb = [math]::Round((Get-Item $setup).Length / 1MB, 1)
 Write-Host "`nГотово: $setup ($mb МБ)" -ForegroundColor Green
-Write-Host "Подписи нет: SmartScreen предупредит о неизвестном издателе — так и задумано для 1.0." -ForegroundColor DarkGray
+Write-Host "Подписи нет: SmartScreen предупредит о неизвестном издателе — так и задумано." -ForegroundColor DarkGray
